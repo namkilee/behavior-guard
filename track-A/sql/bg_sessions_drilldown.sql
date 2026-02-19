@@ -1,14 +1,24 @@
+/* bg_sessions_drilldown.sql
+   Expected placeholders:
+   - {{DAY_START}}
+   - {{DAY_END}}
+   - {{IN_TUPLES}}   e.g. ('u1','c1','sid:1'),('u2','c2','gap:3')
+*/
+
 WITH
-    toDateTime64('2026-01-06 00:00:00', 3) AS day_start,
-    toDateTime64('2026-01-07 00:00:00', 3) AS day_end,
+    toDateTime64('{{DAY_START}}', 3) AS day_start,
+    toDateTime64('{{DAY_END}}', 3) AS day_end,
     30 AS gap_minutes,
+
+    /* ==== 여기부터 너의 sessions_query(세션 추출 SQL) 전체를 그대로 넣어 ==== */
     tr AS (
         SELECT
             project_id,
             id AS trace_id,
-            coalesce(nullIf(user_id, ''),
-                    nullIf(metadata['user_api_key_user_id'], ''),
-                    nullIf(metadata['user_api_key_end_user_id'], '')
+            coalesce(
+                nullIf(user_id, ''),
+                nullIf(metadata['user_api_key_user_id'], ''),
+                nullIf(metadata['user_api_key_end_user_id'], '')
             ) AS user_id_norm,
             nullIf(session_id, '') AS session_id_norm,
             nullIf(metadata['aap_log_name'], '') AS trace_aap_log_name,
@@ -60,7 +70,8 @@ WITH
                 startsWith(route_norm, '/files') OR startsWith(route_norm, '/v1/files'), 'files',
                 startsWith(route_norm, '/moderations') OR startsWith(route_norm, '/v1/moderations'), 'moderations',
                 startsWith(route_norm, '/batches') OR startsWith(route_norm, '/v1/batches'), 'batches',
-                (startsWith(route_norm, '/assistants') OR startsWith(route_norm, '/v1/assistants')
+                (
+                    startsWith(route_norm, '/assistants') OR startsWith(route_norm, '/v1/assistants')
                     OR startsWith(route_norm, '/threads') OR startsWith(route_norm, '/v1/threads')
                     OR startsWith(route_norm, '/runs') OR startsWith(route_norm, '/v1/runs')
                 ), 'assistants',
@@ -80,14 +91,16 @@ WITH
                 obs_name = 'litellm-bad_request_error', 'bad_request',
                 obs_name = 'litellm-IGNORE_THIS', 'error',
                 obs_name IN ('litellm-models', 'litellm-/v1/models', 'litellm-/models', 'litellm-info'), 'info',
-                obs_name IN ('litellm-acompletion', 'litellm-completion',
-                            'litellm-completions', 'litellm-/chat/completions',
-                            'litellm-aresponses'), 'ok',
+                obs_name IN (
+                    'litellm-acompletion', 'litellm-completion',
+                    'litellm-completions', 'litellm-/chat/completions',
+                    'litellm-aresponses'
+                ), 'ok',
                 'ok'
             ) AS outcome_seed,
             multiIf(
                 outcome_seed IN ('rate_limited', 'auth_fail', 'guardrail_warn', 'guardrail_block',
-                                'internal_error', 'bad_request', 'error', 'info'), outcome_seed,
+                                 'internal_error', 'bad_request', 'error', 'info'), outcome_seed,
                 (outcome_seed = 'ok' AND level_norm = 'ERROR'), 'error',
                 'ok'
             ) AS outcome_class
@@ -118,20 +131,12 @@ WITH
                     AND dateDiff('minute', prev_time_in_partition, event_time) >= gap_minutes, 1,
                 0
             ) AS session_start_marker,
-            sum(
-                multiIf(
-                    rn_in_partition = 1, 1,
-                    (NOT has_session_id)
-                        AND prev_time_in_partition IS NOT NULL
-                        AND dateDiff('minute', prev_time_in_partition, event_time) >= gap_minutes, 1,
-                    0
-                )
-            ) OVER (
+            sum(session_start_marker) OVER (
                 PARTITION BY user_id_norm, aap_log_name_norm, session_partition_key
                 ORDER BY event_time
                 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
             ) AS session_seq_in_partition,
-            if (
+            if(
                 has_session_id,
                 concat('sid:', session_id_norm),
                 concat('gap:', toString(session_seq_in_partition))
@@ -145,7 +150,6 @@ WITH
             aap_log_name_norm AS client_name,
             session_key,
             event_time,
-            route_norm AS raw_route,
             route_group,
             obs_name AS raw_name,
             level_norm AS level,
@@ -171,6 +175,7 @@ WITH
         FROM with_session
         WHERE user_id_norm IS NOT NULL AND user_id_norm != ''
     )
+
 SELECT
     user_id,
     client_name,
@@ -182,7 +187,8 @@ SELECT
     arrayMap(x -> x.2, arraySort(groupArray((event_time, outcome_class)))) AS outcomes,
     arrayMap(x -> x.2, arraySort(groupArray((event_time, route_group)))) AS route_groups,
     arrayMap(x -> x.2, arraySort(groupArray((event_time, dt_bucket)))) AS dt_buckets,
-    arrayMap(x -> x.1, arraySort(groupArray((event_time, token)))) AS event_times
+    arraySort(groupArray(event_time)) AS event_times
 FROM token_rows
 GROUP BY user_id, client_name, session_key
-ORDER BY user_id, client_name, session_start;
+HAVING (user_id, client_name, session_key) IN ({{IN_TUPLES}})
+ORDER BY session_start;
