@@ -14,11 +14,12 @@ load_env() {
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="${ENV_FILE:-$ROOT_DIR/.env}"
 
+load_env "$ENV_FILE"
+
 DAY="${1:-${DAY:-}}"
 [[ -n "$DAY" ]] || die "DAY is required. Usage: ./pipeline.sh YYYY-MM-DD  (or set DAY in .env)"
 [[ "$DAY" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || die "Invalid DAY format: $DAY"
 
-load_env "$ENV_FILE"
 
 # (선택) 공통 변수 미리 체크 - 여기서 한 번만 검증해도 됨
 : "${CH_HOST:?Missing CH_HOST in .env}"

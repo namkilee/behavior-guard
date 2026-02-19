@@ -1,23 +1,20 @@
+#!/usr/bin/env python3
 import argparse
 import os
 from pathlib import Path
 from datetime import datetime, timedelta
+from collections import Counter
 
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import RobustScaler
 
-try:
-    import clickhouse_connect
-except Exception:
-    clickhouse_connect = None
 
-
-# ----------------------------
-# Utils
-# ----------------------------
-def resolve_env(key: str, default=None, cast=None):
+# =========================
+# Env / Utils
+# =========================
+def env(key: str, default=None, cast=None):
     v = os.environ.get(key, "")
     if v == "":
         v = default
@@ -26,188 +23,245 @@ def resolve_env(key: str, default=None, cast=None):
     return v
 
 
-def ensure_out_dir(path: str) -> Path:
-    p = Path(path)
+def ensure_dir(p: str | Path) -> Path:
+    p = Path(p)
     p.mkdir(parents=True, exist_ok=True)
     return p
 
 
 def day_range(day: str):
     # day: YYYY-MM-DD
-    start = f"{day} 00:00:00"
     d = datetime.strptime(day, "%Y-%m-%d")
+    start = d.strftime("%Y-%m-%d 00:00:00")
     end = (d + timedelta(days=1)).strftime("%Y-%m-%d 00:00:00")
     return start, end
 
 
-def ch_tuple_escape(s: str) -> str:
-    return "'" + (s or "").replace("\\", "\\\\").replace("'", "\\'") + "'"
+def safe_to_datetime(s):
+    return pd.to_datetime(s, errors="coerce", utc=False)
 
 
-def build_in_tuples(df_top: pd.DataFrame) -> str:
-    tuples = []
-    for _, row in df_top.iterrows():
-        tuples.append(
-            "("
-            + ",".join(
-                [
-                    ch_tuple_escape(str(row["user_id"])),
-                    ch_tuple_escape(str(row["client_name"])),
-                    ch_tuple_escape(str(row["session_key"])),
-                ]
-            )
-            + ")"
-        )
-    return ",".join(tuples) if tuples else "(NULL,NULL,NULL)"
+def topk_str(values, k=3):
+    c = Counter([v for v in values if pd.notna(v)])
+    items = c.most_common(k)
+    return ", ".join([f"{a}({b})" for a, b in items])
 
 
-def load_sql_file(path: str) -> str:
-    return Path(path).read_text(encoding="utf-8")
+def guess_time_col(df: pd.DataFrame):
+    for cand in ["event_ts", "timestamp", "start_time", "created_at", "ts"]:
+        if cand in df.columns:
+            return cand
+    return None
 
 
-def apply_placeholders(sql: str, mapping: dict) -> str:
-    for k, v in mapping.items():
-        sql = sql.replace(k, v)
-    if "{{" in sql and "}}" in sql:
-        leftovers = [seg for seg in sql.split() if "{{" in seg and "}}" in seg]
-        if leftovers:
-            raise ValueError(f"Unreplaced placeholders found: {set(leftovers)}")
-    return sql
-
-
-# ----------------------------
-# Data loading
-# ----------------------------
-def load_features_from_parquet(path: Path) -> pd.DataFrame:
+def inspect_parquet(path: Path, head_n: int = 5):
     if not path.exists():
-        return pd.DataFrame()
-    return pd.read_parquet(path)
+        raise FileNotFoundError(str(path))
+    df = pd.read_parquet(path)
+    print(f"\n[INSPECT] {path}")
+    print("rows:", len(df), "cols:", len(df.columns))
+    print("columns:", df.columns.tolist())
+    print("\ndtypes:\n", df.dtypes)
+    print("\nhead:\n", df.head(head_n).to_string(index=False))
 
 
-def load_raw_from_parquet(path: Path) -> pd.DataFrame:
-    if not path.exists():
-        return pd.DataFrame()
-    return pd.read_parquet(path)
+# =========================
+# Explanation layer helpers
+# =========================
+def add_duration(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    if "session_start" in df.columns and "session_end" in df.columns:
+        s = safe_to_datetime(df["session_start"])
+        e = safe_to_datetime(df["session_end"])
+        df["duration_s"] = (e - s).dt.total_seconds()
+    return df
 
 
-def ch_client_from_env():
-    if clickhouse_connect is None:
-        raise RuntimeError("clickhouse_connect is not installed, cannot use clickhouse source.")
-
-    host = resolve_env("CH_HOST", "localhost")
-    port = resolve_env("CH_PORT", 8123, cast=int)
-    user = resolve_env("CH_USER", "default")
-    password = resolve_env("CH_PASSWORD", "")
-    database = resolve_env("CH_DATABASE", "default")
-
-    return clickhouse_connect.get_client(
-        host=host, port=port, username=user, password=password, database=database
-    )
+def robust_z(df: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
+    X = df[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0).astype(float)
+    med = X.median(axis=0)
+    mad = (X.sub(med)).abs().median(axis=0).replace(0, 1e-9)
+    z = (X.sub(med)).div(mad)
+    return z
 
 
-def load_features_from_clickhouse(feature_sql_path: str, day_start: str, day_end: str) -> pd.DataFrame:
-    ch = ch_client_from_env()
-    sql_raw = load_sql_file(feature_sql_path)
-    sql = apply_placeholders(sql_raw, {"{{DAY_START}}": day_start, "{{DAY_END}}": day_end})
-    return ch.query_df(sql)
+def add_why_top5(df: pd.DataFrame, feature_cols: list[str], topn: int = 5) -> pd.DataFrame:
+    df = df.copy()
+    if not feature_cols:
+        df["why_top5"] = ""
+        return df
+
+    z = robust_z(df, feature_cols)
+
+    why = []
+    for i in range(len(df)):
+        s = z.iloc[i]
+        top = s.abs().sort_values(ascending=False).head(topn).index.tolist()
+        parts = [f"{k}:{s[k]:+.2f}" for k in top]
+        why.append(", ".join(parts))
+    df["why_top5"] = why
+    return df
 
 
-def load_drilldown_from_clickhouse(drill_sql_path: str, day_start: str, day_end: str, in_tuples: str) -> pd.DataFrame:
-    ch = ch_client_from_env()
-    sql_raw = load_sql_file(drill_sql_path)
-    sql = apply_placeholders(
-        sql_raw,
-        {"{{DAY_START}}": day_start, "{{DAY_END}}": day_end, "{{IN_TUPLES}}": in_tuples},
-    )
-    return ch.query_df(sql)
+def add_error_rate_from_outcome(df: pd.DataFrame, outcome_col="outcome_class") -> pd.DataFrame:
+    df = df.copy()
+    if outcome_col not in df.columns:
+        return df
+    # 매우 단순한 휴리스틱(필요하면 너희 outcome taxonomy에 맞춰 개선)
+    s = df[outcome_col].astype(str)
+    is_err = s.str.contains("fail|error|deny|blocked|429|5xx", case=False, regex=True)
+    df["is_error"] = is_err
+    return df
 
 
-# ----------------------------
-# Drilldown for parquet mode
-# ----------------------------
-def drilldown_from_raw_parquet(raw: pd.DataFrame, top: pd.DataFrame) -> pd.DataFrame:
-    """
-    raw parquet가 세션 단위가 아니라 "이벤트/관측치 row"라는 가정 하에,
-    Top-K 세션만 필터링해서 간단 집계(drilldown summary)를 만든다.
+# =========================
+# Drilldown builders
+# =========================
+KEY_COLS = ["user_id", "client_name", "session_key"]
 
-    raw에 아래 컬럼이 있으면 활용:
-      - user_id, client_name, session_key (필수)
-      - token, outcome_class, route_group, dt_bucket 등(있으면 카운트/요약)
-      - timestamp / event_ts / start_time 등(있으면 기간)
-    """
-    key_cols = ["user_id", "client_name", "session_key"]
-    for c in key_cols:
+
+def is_event_level_raw(raw: pd.DataFrame) -> bool:
+    """세션당 row가 여러 개인지로 이벤트 레벨 여부 추정."""
+    for c in KEY_COLS:
         if c not in raw.columns:
-            raise ValueError(f"raw parquet missing required column: {c}")
+            return False
+    sizes = raw.groupby(KEY_COLS).size()
+    return (sizes.max() if len(sizes) else 0) > 1
 
-    # Top-K 키로 inner join 필터
-    keys = top[key_cols].drop_duplicates()
-    filt = raw.merge(keys, on=key_cols, how="inner")
 
+def build_drilldown_event_level(raw: pd.DataFrame, top_keys: pd.DataFrame) -> pd.DataFrame:
+    # raw: 이벤트/관측치 1행 = 1 event 가정
+    for c in KEY_COLS:
+        if c not in raw.columns:
+            raise ValueError(f"raw missing required key column: {c}")
+
+    filt = raw.merge(top_keys[KEY_COLS].drop_duplicates(), on=KEY_COLS, how="inner")
     if filt.empty:
         return pd.DataFrame()
 
-    # 가능한 컬럼들로 요약
-    agg = {c: "count" for c in key_cols[:1]}  # dummy count source
-    # 더 의미 있는 집계
-    if "token" in filt.columns:
-        agg["token"] = "nunique"
-    if "outcome_class" in filt.columns:
-        agg["outcome_class"] = "nunique"
-    if "route_group" in filt.columns:
-        agg["route_group"] = "nunique"
-    if "dt_bucket" in filt.columns:
-        agg["dt_bucket"] = "nunique"
+    time_col = guess_time_col(filt)
 
-    # time span
-    time_col = None
-    for cand in ["event_ts", "timestamp", "start_time", "created_at"]:
-        if cand in filt.columns:
-            time_col = cand
-            break
+    def agg_group(g: pd.DataFrame) -> pd.Series:
+        out = {
+            "n_events_dd": int(len(g)),
+            "n_tokens_dd": int(g["token"].nunique()) if "token" in g.columns else np.nan,
+            "n_outcomes_dd": int(g["outcome_class"].nunique()) if "outcome_class" in g.columns else np.nan,
+            "token_top3": topk_str(g["token"], 3) if "token" in g.columns else "",
+            "route_group_top3": topk_str(g["route_group"], 3) if "route_group" in g.columns else "",
+            "outcome_top3": topk_str(g["outcome_class"], 3) if "outcome_class" in g.columns else "",
+        }
+        if time_col:
+            out["first_ts"] = g[time_col].min()
+            out["last_ts"] = g[time_col].max()
 
-    if time_col:
-        # min/max
-        grouped = filt.groupby(key_cols).agg(
-            n_events=(key_cols[0], "count"),
-            n_tokens=("token", "nunique") if "token" in filt.columns else (key_cols[0], "count"),
-            n_outcomes=("outcome_class", "nunique") if "outcome_class" in filt.columns else (key_cols[0], "count"),
-            first_ts=(time_col, "min"),
-            last_ts=(time_col, "max"),
-        ).reset_index()
-    else:
-        grouped = filt.groupby(key_cols).agg(
-            n_events=(key_cols[0], "count"),
-            n_tokens=("token", "nunique") if "token" in filt.columns else (key_cols[0], "count"),
-            n_outcomes=("outcome_class", "nunique") if "outcome_class" in filt.columns else (key_cols[0], "count"),
-        ).reset_index()
+        if "outcome_class" in g.columns:
+            s = g["outcome_class"].astype(str)
+            is_err = s.str.contains("fail|error|deny|blocked|429|5xx", case=False, regex=True)
+            out["error_rate_dd"] = float(is_err.mean())
+        return pd.Series(out)
 
-    # risk_score join
-    out = grouped.merge(
-        top[key_cols + ["risk_score"]],
-        on=key_cols,
-        how="left",
-    ).sort_values("risk_score", ascending=False)
-
-    return out
+    dd = filt.groupby(KEY_COLS, dropna=False).apply(agg_group).reset_index()
+    return dd
 
 
-# ----------------------------
-# Model
-# ----------------------------
-def score_features(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    if df.empty:
-        return df, df
+def parse_maybe_list(x):
+    """세션 1행 요약 raw에서 list/array 또는 문자열로 저장된 값을 최대한 list로 변환."""
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return []
+    if isinstance(x, list):
+        return x
+    # pandas may store arrays as np.ndarray/object
+    if isinstance(x, np.ndarray):
+        return x.tolist()
+    if isinstance(x, str):
+        s = x.strip()
+        if s == "":
+            return []
+        # 아주 단순: "a,b,c" 형태
+        if "," in s and "[" not in s and "{" not in s:
+            return [t.strip() for t in s.split(",") if t.strip()]
+        # JSON-like list 시도
+        if (s.startswith("[") and s.endswith("]")):
+            try:
+                import json
+                v = json.loads(s)
+                return v if isinstance(v, list) else [v]
+            except Exception:
+                return [s]
+        return [s]
+    # 기타 타입은 문자열화
+    return [str(x)]
 
-    id_cols = ["user_id", "client_name", "session_key", "session_start", "session_end"]
-    # 존재하는 id 컬럼만 제외
-    id_cols_present = [c for c in id_cols if c in df.columns]
-    feature_cols = [c for c in df.columns if c not in id_cols_present]
+
+def build_drilldown_session_level(raw: pd.DataFrame, top_keys: pd.DataFrame) -> pd.DataFrame:
+    """
+    raw가 세션당 1행 요약일 때:
+    - tokens/outcomes/route_group 같은 컬럼이 array(또는 문자열)로 들어있으면 요약
+    - 없으면 drilldown이 빈약할 수밖에 없으니 가능한 최소만 제공
+    """
+    for c in KEY_COLS:
+        if c not in raw.columns:
+            raise ValueError(f"raw missing required key column: {c}")
+
+    filt = raw.merge(top_keys[KEY_COLS].drop_duplicates(), on=KEY_COLS, how="inner")
+    if filt.empty:
+        return pd.DataFrame()
+
+    # 후보 컬럼 이름들 (네 스키마에 맞춰 추가 가능)
+    token_col = "token" if "token" in filt.columns else ("tokens" if "tokens" in filt.columns else None)
+    outcome_col = "outcome_class" if "outcome_class" in filt.columns else ("outcomes" if "outcomes" in filt.columns else None)
+    route_col = "route_group" if "route_group" in filt.columns else ("route_groups" if "route_groups" in filt.columns else None)
+
+    rows = []
+    for _, r in filt.iterrows():
+        tokens = parse_maybe_list(r[token_col]) if token_col else []
+        outs = parse_maybe_list(r[outcome_col]) if outcome_col else []
+        routes = parse_maybe_list(r[route_col]) if route_col else []
+
+        row = {
+            "user_id": r["user_id"],
+            "client_name": r["client_name"],
+            "session_key": r["session_key"],
+            "n_events_dd": int(r["n_events"]) if "n_events" in filt.columns and pd.notna(r.get("n_events")) else (len(tokens) if tokens else np.nan),
+            "n_tokens_dd": len(set(tokens)) if tokens else np.nan,
+            "n_outcomes_dd": len(set(outs)) if outs else np.nan,
+            "token_top3": topk_str(tokens, 3) if tokens else "",
+            "route_group_top3": topk_str(routes, 3) if routes else "",
+            "outcome_top3": topk_str(outs, 3) if outs else "",
+        }
+
+        if outs:
+            s = pd.Series([str(x) for x in outs])
+            is_err = s.str.contains("fail|error|deny|blocked|429|5xx", case=False, regex=True)
+            row["error_rate_dd"] = float(is_err.mean())
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+# =========================
+# Track A core
+# =========================
+def score_with_isolation_forest(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    df = df.copy()
+
+    # id columns to exclude from feature vector
+    id_candidates = ["user_id", "client_name", "session_key", "session_start", "session_end"]
+    id_cols = [c for c in id_candidates if c in df.columns]
+
+    # exclude model outputs if rerun
+    exclude = set(id_cols + ["anomaly_score", "risk_score", "risk_pct", "duration_s", "why_top5"])
+    feature_cols = [c for c in df.columns if c not in exclude]
 
     if not feature_cols:
-        raise ValueError("No feature columns found (after excluding id columns).")
+        raise ValueError("No feature columns found. Check your session_features parquet schema.")
 
-    X = df[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0).astype(float)
+    # Ensure numeric features
+    X = df[feature_cols].replace([np.inf, -np.inf], np.nan)
+    # try cast numeric; non-numeric -> NaN -> 0
+    for c in feature_cols:
+        X[c] = pd.to_numeric(X[c], errors="coerce")
+    X = X.fillna(0.0).astype(float)
 
     scaler = RobustScaler()
     X_scaled = scaler.fit_transform(X)
@@ -221,160 +275,160 @@ def score_features(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     iso.fit(X_scaled)
 
     anomaly_score = -iso.decision_function(X_scaled)
-    df = df.copy()
     df["anomaly_score"] = anomaly_score
 
+    # risk_score: p1~p99 scaling + clip
     p1, p99 = np.quantile(anomaly_score, [0.01, 0.99])
-    df["risk_score"] = ((df["anomaly_score"] - p1) / (p99 - p1 + 1e-9) * 100).clip(0, 100)
+    diff = float(p99 - p1)
+    if diff < 1e-9:
+        # fallback: percentile
+        df["risk_score"] = pd.Series(anomaly_score).rank(pct=True) * 100
+    else:
+        df["risk_score"] = ((df["anomaly_score"] - p1) / (diff) * 100).clip(0, 100)
 
-    return df
+    # risk_pct: 항상 보기 좋은 퍼센타일(설명용)
+    df["risk_pct"] = pd.Series(anomaly_score).rank(pct=True) * 100
+
+    return df, feature_cols
 
 
 def main():
-    ap = argparse.ArgumentParser(description="BehaviorGuard Track A (Parquet-first; ClickHouse optional)")
-    ap.add_argument("--day", help="YYYY-MM-DD (preferred for pipeline)")
-    ap.add_argument("--day-start")
-    ap.add_argument("--day-end")
-
-    ap.add_argument("--source", choices=["auto", "parquet", "clickhouse"], default="auto")
-
-    # parquet inputs (default: out/)
-    ap.add_argument("--features-parquet", help="session_features parquet path")
-    ap.add_argument("--raw-parquet", help="sessions_raw parquet path (for drilldown)")
-
-    # clickhouse inputs (optional)
-    ap.add_argument("--feature-sql", help="feature SQL path (built sql ok)")
-    ap.add_argument("--drilldown-sql", help="drilldown SQL path")
-
-    # outputs
+    ap = argparse.ArgumentParser(description="BehaviorGuard Track A (Parquet-first) with Explanation Layer")
+    ap.add_argument("--day", help="YYYY-MM-DD (pipeline friendly)")
     ap.add_argument("--topk", type=int, default=None)
     ap.add_argument("--out-dir", default=None)
+
+    ap.add_argument("--features-parquet", default=None, help="Override features parquet path")
+    ap.add_argument("--raw-parquet", default=None, help="Override raw parquet path")
+
     ap.add_argument("--save-csv", type=int, default=None)
     ap.add_argument("--save-parquet", type=int, default=None)
 
+    # inspect helper
+    ap.add_argument("--inspect-parquet", default=None, help="Print schema/head of parquet file then exit")
+
     args = ap.parse_args()
 
-    # env defaults (pipeline에서 export되어 내려온다고 가정)
-    out_dir = resolve_env("OUT_DIR", args.out_dir or "out")
-    topk = resolve_env("TOPK", args.topk or 100, cast=int)
-    save_csv = resolve_env("SAVE_CSV", args.save_csv if args.save_csv is not None else 1, cast=int)
-    save_parquet = resolve_env("SAVE_PARQUET", args.save_parquet if args.save_parquet is not None else 1, cast=int)
-
-    # day window
-    if args.day:
-        day_start, day_end = day_range(args.day)
-    else:
-        day_start = args.day_start or resolve_env("DAY_START", None)
-        day_end = args.day_end or resolve_env("DAY_END", None)
-        if not day_start or not day_end:
-            raise ValueError("Provide --day (preferred) or DAY_START/DAY_END (args/env).")
-
-    out_path = ensure_out_dir(out_dir)
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    # parquet default paths (match build_exports.sh)
-    day_for_paths = args.day
-    if not day_for_paths:
-        # DAY_START 기준으로 파일명 추정(YYYY-MM-DD)
-        day_for_paths = str(day_start).split(" ")[0]
-
-    features_parquet = Path(args.features_parquet or resolve_env("FEATURES_PARQUET", f"{out_dir}/session_features_{day_for_paths}.parquet"))
-    raw_parquet = Path(args.raw_parquet or resolve_env("RAW_PARQUET", f"{out_dir}/sessions_raw_{day_for_paths}.parquet"))
-
-    # clickhouse sql defaults (built sql 사용)
-    feature_sql_path = args.feature_sql or resolve_env("FEATURE_SQL_PATH", "sql/build/export_session_features.built.sql")
-    drill_sql_path = args.drilldown_sql or resolve_env("DRILLDOWN_SQL_PATH", "sql/bg_sessions_drilldown.sql")
-
-    # -------------------------
-    # Load features
-    # -------------------------
-    df_features = pd.DataFrame()
-
-    if args.source in ["auto", "parquet"]:
-        if features_parquet.exists():
-            print(f"[INFO] Loading features from parquet: {features_parquet}")
-            df_features = load_features_from_parquet(features_parquet)
-        elif args.source == "parquet":
-            raise FileNotFoundError(f"Features parquet not found: {features_parquet}")
-
-    if df_features.empty and args.source in ["auto", "clickhouse"]:
-        print(f"[INFO] Loading features from ClickHouse using SQL: {feature_sql_path}")
-        df_features = load_features_from_clickhouse(feature_sql_path, day_start, day_end)
-
-    if df_features.empty:
-        print("[INFO] No rows returned for features.")
+    if args.inspect_parquet:
+        inspect_parquet(Path(args.inspect_parquet))
         return
 
-    # -------------------------
-    # Score
-    # -------------------------
-    df_scored = score_features(df_features)
-    top = df_scored.sort_values("risk_score", ascending=False).head(topk).copy()
+    day = args.day or env("DAY", None)
+    if not day:
+        raise ValueError("Provide --day YYYY-MM-DD or set DAY in env.")
 
-    # -------------------------
-    # Drilldown
-    # -------------------------
-    drill = pd.DataFrame()
+    out_dir = env("OUT_DIR", args.out_dir or "out")
+    topk = env("TOPK", args.topk or 100, cast=int)
+    save_csv = env("SAVE_CSV", args.save_csv if args.save_csv is not None else 1, cast=int)
+    save_parquet = env("SAVE_PARQUET", args.save_parquet if args.save_parquet is not None else 1, cast=int)
 
-    # Parquet drilldown (preferred in current mode)
-    if raw_parquet.exists():
-        print(f"[INFO] Loading raw from parquet for drilldown: {raw_parquet}")
-        raw = load_raw_from_parquet(raw_parquet)
-        if not raw.empty:
-            drill = drilldown_from_raw_parquet(raw, top)
+    out_path = ensure_dir(out_dir)
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # If parquet drilldown didn't work and ClickHouse is allowed, try ClickHouse drilldown SQL
-    if drill.empty and args.source in ["auto", "clickhouse"] and drill_sql_path:
-        if clickhouse_connect is None:
-            print("[WARN] clickhouse_connect not available, skipping clickhouse drilldown.")
+    # default parquet paths (match build_exports.sh)
+    features_path = Path(args.features_parquet or env("FEATURES_PARQUET", f"{out_dir}/session_features_{day}.parquet"))
+    raw_path = Path(args.raw_parquet or env("RAW_PARQUET", f"{out_dir}/sessions_raw_{day}.parquet"))
+
+    if not features_path.exists():
+        raise FileNotFoundError(f"features parquet not found: {features_path}")
+
+    print(f"[INFO] Loading features: {features_path}")
+    df = pd.read_parquet(features_path)
+    if df.empty:
+        print("[INFO] features parquet empty.")
+        return
+
+    # score
+    df = add_duration(df)
+    df_scored, feature_cols = score_with_isolation_forest(df)
+
+    # explanation: why_top5 from robust z-scores
+    df_scored = add_why_top5(df_scored, feature_cols, topn=5)
+
+    # top-k selection
+    top = df_scored.sort_values(["risk_pct", "risk_score"], ascending=False).head(topk).copy()
+
+    # drilldown
+    dd = pd.DataFrame()
+    if raw_path.exists():
+        print(f"[INFO] Loading raw for drilldown: {raw_path}")
+        raw = pd.read_parquet(raw_path)
+        if raw.empty:
+            print("[WARN] raw parquet is empty, drilldown will be empty.")
         else:
-            print(f"[INFO] Loading drilldown from ClickHouse using SQL: {drill_sql_path}")
-            in_tuples = build_in_tuples(top)
-            drill = load_drilldown_from_clickhouse(drill_sql_path, day_start, day_end, in_tuples)
+            # Ensure keys exist; if not, drilldown can't join
+            missing_keys = [c for c in KEY_COLS if c not in raw.columns]
+            if missing_keys:
+                print(f"[WARN] raw parquet missing key cols {missing_keys}. Cannot drilldown-join.")
+            else:
+                if is_event_level_raw(raw):
+                    print("[INFO] raw looks EVENT-level (multiple rows per session). Building event-level drilldown.")
+                    dd = build_drilldown_event_level(raw, top)
+                else:
+                    print("[WARN] raw looks SESSION-level (1 row per session). Building session-level drilldown fallback.")
+                    dd = build_drilldown_session_level(raw, top)
+    else:
+        print(f"[WARN] raw parquet not found: {raw_path} (drilldown will be empty)")
 
-            if not drill.empty and "risk_score" not in drill.columns:
-                drill = drill.merge(
-                    top[["user_id", "client_name", "session_key", "risk_score"]],
-                    on=["user_id", "client_name", "session_key"],
-                    how="left",
-                ).sort_values("risk_score", ascending=False)
+    # merge drilldown summaries into top summary (always on keys)
+    if not dd.empty:
+        top = top.merge(dd, on=KEY_COLS, how="left")
+    else:
+        # still include placeholders to make the UI consistent
+        for c in ["n_events_dd", "n_tokens_dd", "n_outcomes_dd", "error_rate_dd", "route_group_top3", "outcome_top3", "token_top3"]:
+            if c not in top.columns:
+                top[c] = np.nan if c.endswith("_dd") or c.endswith("_rate_dd") else ""
 
-    # -------------------------
-    # Save
-    # -------------------------
-    features_out_csv = out_path / f"trackA_features_{run_id}.csv"
-    top_out_csv = out_path / f"trackA_top_{run_id}.csv"
-    drill_out_csv = out_path / f"trackA_drilldown_{run_id}.csv"
+    # summary columns (human friendly)
+    summary_cols = [
+        "risk_pct", "risk_score", "anomaly_score",
+        "user_id", "client_name", "session_key",
+        "n_events", "duration_s",
+        "n_events_dd", "n_tokens_dd", "n_outcomes_dd",
+        "error_rate_dd",
+        "route_group_top3", "outcome_top3", "token_top3",
+        "why_top5",
+    ]
+    summary_cols = [c for c in summary_cols if c in top.columns]
+    summary = top[summary_cols].copy()
+
+    # output files
+    base = f"{day}_{run_id}"
+    summary_csv = out_path / f"trackA_summary_top_{base}.csv"
+    drill_csv = out_path / f"trackA_drilldown_{base}.csv"
+    scored_csv = out_path / f"trackA_features_scored_{base}.csv"
 
     if save_csv:
-        df_scored.to_csv(features_out_csv, index=False)
-        top.to_csv(top_out_csv, index=False)
-        if not drill.empty:
-            drill.to_csv(drill_out_csv, index=False)
+        df_scored.to_csv(scored_csv, index=False)
+        summary.to_csv(summary_csv, index=False)
+        if not dd.empty:
+            dd2 = dd.merge(top[KEY_COLS + ["risk_pct", "risk_score"]], on=KEY_COLS, how="left") if "risk_score" in top.columns else dd
+            dd2.to_csv(drill_csv, index=False)
 
     if save_parquet:
-        df_scored.to_parquet(out_path / f"trackA_features_{run_id}.parquet", index=False)
-        top.to_parquet(out_path / f"trackA_top_{run_id}.parquet", index=False)
-        if not drill.empty:
-            drill.to_parquet(out_path / f"trackA_drilldown_{run_id}.parquet", index=False)
+        df_scored.to_parquet(out_path / f"trackA_features_scored_{base}.parquet", index=False)
+        summary.to_parquet(out_path / f"trackA_summary_top_{base}.parquet", index=False)
+        if not dd.empty:
+            dd2 = dd.merge(top[KEY_COLS + ["risk_pct", "risk_score"]], on=KEY_COLS, how="left") if "risk_score" in top.columns else dd
+            dd2.to_parquet(out_path / f"trackA_drilldown_{base}.parquet", index=False)
 
-    # -------------------------
-    # Console summary
-    # -------------------------
-    print("\n=== TOP ANOMALOUS SESSIONS (summary) ===\n")
-    show_cols = ["user_id", "client_name", "session_key", "session_start", "session_end", "n_events", "risk_score"]
-    show_cols = [c for c in show_cols if c in top.columns]
-    print(top[show_cols].to_string(index=False))
+    # console print (readable)
+    print("\n=== TOP-K SUMMARY (human-friendly) ===\n")
+    print(summary.head(min(30, len(summary))).to_string(index=False))
 
-    if not drill.empty:
-        print("\n=== DRILLDOWN (first 10) ===\n")
-        drill_show_cols = ["risk_score", "user_id", "client_name", "session_key", "n_events", "n_tokens", "n_outcomes", "first_ts", "last_ts"]
-        drill_show_cols = [c for c in drill_show_cols if c in drill.columns]
-        print(drill[drill_show_cols].head(10).to_string(index=False))
+    if not dd.empty:
+        print("\n=== DRILLDOWN (first 20) ===\n")
+        cols = [c for c in ["risk_pct", "risk_score"] + KEY_COLS + ["n_events_dd","error_rate_dd","route_group_top3","outcome_top3","token_top3","first_ts","last_ts"] if c in dd.columns or c in top.columns]
+        show = dd.merge(top[KEY_COLS + ["risk_pct","risk_score"]], on=KEY_COLS, how="left") if "risk_score" in top.columns else dd
+        cols = [c for c in cols if c in show.columns]
+        print(show[cols].head(20).to_string(index=False))
     else:
-        print("\n[INFO] Drilldown is empty (raw parquet missing or schema mismatch, and clickhouse drilldown not used).\n")
+        print("\n[INFO] Drilldown is empty or not informative. (Likely raw parquet is session-level or missing keys.)\n")
 
     print("\nSaved outputs to:", str(out_path))
+    print(" -", summary_csv if save_csv else f"{out_path}/trackA_summary_top_{base}.parquet")
+    if not dd.empty:
+        print(" -", drill_csv if save_csv else f"{out_path}/trackA_drilldown_{base}.parquet")
 
 
 if __name__ == "__main__":
