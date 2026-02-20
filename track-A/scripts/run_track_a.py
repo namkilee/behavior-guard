@@ -30,7 +30,6 @@ def ensure_dir(p: str | Path) -> Path:
 
 
 def day_range(day: str):
-    # day: YYYY-MM-DD
     d = datetime.strptime(day, "%Y-%m-%d")
     start = d.strftime("%Y-%m-%d 00:00:00")
     end = (d + timedelta(days=1)).strftime("%Y-%m-%d 00:00:00")
@@ -86,12 +85,9 @@ def robust_stats(df: pd.DataFrame, feature_cols: list[str]):
 
 def add_why_top5(df: pd.DataFrame, feature_cols: list[str], topn: int = 5) -> pd.DataFrame:
     """
-    기존 robust z-score 기반이지만,
-    MAD=0(거의 대부분 0인 count feature)에서 z가 폭발하는 문제를 해결:
-      - med==0 & mad==0 & value>0  =>  rare_nonzero로 표시
-      - 그 외는 z = (x-med)/(mad or 1e-9)
-    출력 포맷:
-      feature=value (med=..., z=...)  또는  feature=value (rare_nonzero)
+    robust z-score 기반 + MAD=0 폭발 방지:
+      - med==0 & mad==0 & value!=0  => rare_nonzero
+      - 그 외는 z=(x-med)/mad
     """
     df = df.copy()
     if not feature_cols:
@@ -100,7 +96,6 @@ def add_why_top5(df: pd.DataFrame, feature_cols: list[str], topn: int = 5) -> pd
 
     X, med, mad = robust_stats(df, feature_cols)
 
-    # z 계산(안전)
     mad_safe = mad.replace(0, np.nan)
     z = (X.sub(med)).div(mad_safe)
     z = z.replace([np.inf, -np.inf], np.nan)
@@ -110,17 +105,14 @@ def add_why_top5(df: pd.DataFrame, feature_cols: list[str], topn: int = 5) -> pd
         row = X.iloc[i]
         zrow = z.iloc[i]
 
-        # rare_nonzero 후보(대부분 0인데 이 row만 0이 아님)
         rare = []
         for k in feature_cols:
             if (med[k] == 0) and (mad[k] == 0) and (row[k] != 0):
                 rare.append(k)
 
-        # z 기반 top (rare는 z가 NaN일 수 있으니 별도로)
         zabs = zrow.abs().fillna(0.0)
         top_z = zabs.sort_values(ascending=False).head(topn).index.tolist()
 
-        # 우선: rare_nonzero를 앞쪽에 배치(최대 topn까지만)
         picked = []
         for k in rare:
             if len(picked) >= topn:
@@ -139,11 +131,9 @@ def add_why_top5(df: pd.DataFrame, feature_cols: list[str], topn: int = 5) -> pd
             else:
                 zv = zrow[k]
                 if pd.isna(zv):
-                    # z를 계산할 수 없으면 간단 표기
                     parts.append(f"{k}={row[k]:.2f} (med={med[k]:.2f})")
                 else:
                     parts.append(f"{k}={row[k]:.2f} (med={med[k]:.2f}, z={zv:+.2f})")
-
         why.append("; ".join(parts))
 
     df["why_top5"] = why
@@ -157,7 +147,6 @@ KEY_COLS = ["user_id", "client_name", "session_key"]
 
 
 def is_event_level_raw(raw: pd.DataFrame) -> bool:
-    """세션당 row가 여러 개인지로 이벤트 레벨 여부 추정."""
     for c in KEY_COLS:
         if c not in raw.columns:
             return False
@@ -170,19 +159,13 @@ def is_list_like(x) -> bool:
 
 
 def is_packed_session_raw(raw: pd.DataFrame) -> bool:
-    """
-    세션당 1행인데 이벤트가 array/list로 들어있는 형태인지 감지.
-    예: tokens/outcomes/route_groups/event_times/dt_buckets
-    """
     for c in KEY_COLS:
         if c not in raw.columns:
             return False
-
     candidates = ["tokens", "outcomes", "route_groups", "event_times", "dt_buckets"]
     present = [c for c in candidates if c in raw.columns]
     if not present:
         return False
-
     sample = raw[present].head(50)
     for c in present:
         if sample[c].apply(is_list_like).any():
@@ -191,7 +174,6 @@ def is_packed_session_raw(raw: pd.DataFrame) -> bool:
 
 
 def parse_maybe_list(x):
-    """세션 1행 요약 raw에서 list/array 또는 문자열로 저장된 값을 최대한 list로 변환."""
     if x is None or (isinstance(x, float) and np.isnan(x)):
         return []
     if isinstance(x, list):
@@ -202,10 +184,8 @@ def parse_maybe_list(x):
         s = x.strip()
         if s == "":
             return []
-        # 아주 단순: "a,b,c"
         if "," in s and "[" not in s and "{" not in s:
             return [t.strip() for t in s.split(",") if t.strip()]
-        # JSON-like list
         if (s.startswith("[") and s.endswith("]")):
             try:
                 import json
@@ -217,12 +197,15 @@ def parse_maybe_list(x):
     return [str(x)]
 
 
-def explode_packed_raw(raw: pd.DataFrame) -> pd.DataFrame:
-    """
-    세션 1행 + 배열(raw)을 이벤트 단위 row로 explode.
-    표준 컬럼명:
-      token, outcome_class, route_group, dt_bucket, event_time
-    """
+# (C) token typo normalization (disabled by default)
+TOKEN_FIX_DEFAULT = {
+    # example:
+    # "rate_lmiited": "rate_limited",
+    # "t_nrom": "t_norm",
+}
+
+
+def explode_packed_raw(raw: pd.DataFrame, normalize_token: bool = False, token_fix_map: dict | None = None) -> pd.DataFrame:
     raw = raw.copy()
 
     rename_map = {}
@@ -241,11 +224,9 @@ def explode_packed_raw(raw: pd.DataFrame) -> pd.DataFrame:
 
     explode_cols = [c for c in ["token", "outcome_class", "route_group", "dt_bucket", "event_time"] if c in raw.columns]
 
-    # 문자열/ndarray 등 대응
     for c in explode_cols:
         raw[c] = raw[c].apply(parse_maybe_list)
 
-    # 길이 불일치 안전장치: 가장 짧은 길이에 맞춰 자름
     def trim_row(r):
         lens = []
         for c in explode_cols:
@@ -266,14 +247,15 @@ def explode_packed_raw(raw: pd.DataFrame) -> pd.DataFrame:
     if "event_time" in ev.columns:
         ev["event_time"] = safe_to_datetime(ev["event_time"])
 
+    if normalize_token and "token" in ev.columns:
+        fix = token_fix_map or TOKEN_FIX_DEFAULT
+        if fix:
+            ev["token"] = ev["token"].astype(str).str.strip().replace(fix)
+
     return ev
 
 
 def _peak_window_30s(t: pd.Series, window_s: int = 30):
-    """
-    t: datetime series sorted/cleaned inside
-    returns (start_ts, end_ts, max_count)
-    """
     if t is None:
         return (pd.NaT, pd.NaT, 0)
     tt = pd.to_datetime(t.dropna(), errors="coerce").dropna().sort_values()
@@ -301,24 +283,17 @@ def _peak_window_30s(t: pd.Series, window_s: int = 30):
     return (start, end, int(best))
 
 
+# (A) timeline formatting: include date + time (fixed)
 def _fmt_ts(ts):
     if ts is None or pd.isna(ts):
         return ""
-    # 초 단위까지만
     try:
-        return pd.to_datetime(ts).strftime("%H:%M:%S")
+        return pd.to_datetime(ts).strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         return str(ts)
 
 
 def build_drilldown_event_level(raw: pd.DataFrame, top_keys: pd.DataFrame) -> pd.DataFrame:
-    """
-    이벤트 레벨 raw 또는 explode된 이벤트 raw를 받아 drilldown을 생성.
-    요구사항(2~4):
-      - burst_score, route_skew
-      - timeline_1line
-      - top_error_route
-    """
     for c in KEY_COLS:
         if c not in raw.columns:
             raise ValueError(f"raw missing required key column: {c}")
@@ -332,13 +307,11 @@ def build_drilldown_event_level(raw: pd.DataFrame, top_keys: pd.DataFrame) -> pd
     def agg_group(g: pd.DataFrame) -> pd.Series:
         n = int(len(g))
 
-        # Top3 strings
         token_top3 = topk_str(g["token"], 3) if "token" in g.columns else ""
         route_top3 = topk_str(g["route_group"], 3) if "route_group" in g.columns else ""
         outcome_top3 = topk_str(g["outcome_class"], 3) if "outcome_class" in g.columns else ""
         dt_top3 = topk_str(g["dt_bucket"], 3) if "dt_bucket" in g.columns else ""
 
-        # Counts/ratios
         error_rate = np.nan
         rate_limited_rate = np.nan
         top_error_route = ""
@@ -352,7 +325,6 @@ def build_drilldown_event_level(raw: pd.DataFrame, top_keys: pd.DataFrame) -> pd
             is_rl = s.str.contains("rate_limited|429", case=False, regex=True)
             rate_limited_rate = float(is_rl.mean())
 
-            # top_error_route: 에러가 가장 많은 route_group
             if "route_group" in g.columns:
                 err_g = g.loc[is_err, "route_group"]
                 if len(err_g):
@@ -365,7 +337,6 @@ def build_drilldown_event_level(raw: pd.DataFrame, top_keys: pd.DataFrame) -> pd
             if len(vc):
                 top1_route_ratio = float(vc.iloc[0] / n)
 
-        # Time/burst
         first_ts = pd.NaT
         last_ts = pd.NaT
         peak_start = pd.NaT
@@ -380,22 +351,20 @@ def build_drilldown_event_level(raw: pd.DataFrame, top_keys: pd.DataFrame) -> pd
             first_ts = tt.min()
             last_ts = tt.max()
 
-            # gaps
             t_sorted = tt.dropna().sort_values()
             if len(t_sorted) >= 2:
                 gaps = t_sorted.diff().dt.total_seconds().dropna()
                 if len(gaps):
                     p50_gap_s = float(np.quantile(gaps, 0.50))
                     p95_gap_s = float(np.quantile(gaps, 0.95))
-            # peak window
+
             peak_start, peak_end, peak_events = _peak_window_30s(t_sorted, window_s=30)
             max_events_in_30s = float(peak_events)
 
-        # signals
         route_skew = float(top1_route_ratio) if pd.notna(top1_route_ratio) else np.nan
         burst_score = float(max_events_in_30s / (n + 1e-9)) if pd.notna(max_events_in_30s) else np.nan
 
-        # timeline 1-line
+        # timeline 1-line (A: date+time)
         tl_parts = []
         if pd.notna(first_ts) and pd.notna(last_ts):
             tl_parts.append(f"span={_fmt_ts(first_ts)}~{_fmt_ts(last_ts)}")
@@ -422,6 +391,7 @@ def build_drilldown_event_level(raw: pd.DataFrame, top_keys: pd.DataFrame) -> pd
             "rate_limited_rate_dd": rate_limited_rate,
 
             "route_skew": route_skew,
+            "route_skew_pct": f"{route_skew:.0%}" if pd.notna(route_skew) else "",
             "burst_score": burst_score,
 
             "first_ts": first_ts,
@@ -442,15 +412,12 @@ def build_drilldown_event_level(raw: pd.DataFrame, top_keys: pd.DataFrame) -> pd
     return dd
 
 
-def build_drilldown_from_packed_raw(raw: pd.DataFrame, top_keys: pd.DataFrame) -> pd.DataFrame:
-    ev = explode_packed_raw(raw)
+def build_drilldown_from_packed_raw(raw: pd.DataFrame, top_keys: pd.DataFrame, normalize_token: bool = False) -> pd.DataFrame:
+    ev = explode_packed_raw(raw, normalize_token=normalize_token)
     return build_drilldown_event_level(ev, top_keys)
 
 
 def build_drilldown_session_level(raw: pd.DataFrame, top_keys: pd.DataFrame) -> pd.DataFrame:
-    """
-    진짜 세션 1행 요약(배열도 없음)일 때의 fallback.
-    """
     for c in KEY_COLS:
         if c not in raw.columns:
             raise ValueError(f"raw missing required key column: {c}")
@@ -469,7 +436,6 @@ def build_drilldown_session_level(raw: pd.DataFrame, top_keys: pd.DataFrame) -> 
         outs = parse_maybe_list(r[outcome_col]) if outcome_col else []
         routes = parse_maybe_list(r[route_col]) if route_col else []
 
-        # 간이 route_skew 추정
         route_skew = np.nan
         if routes:
             c = Counter([x for x in routes if x is not None])
@@ -490,6 +456,7 @@ def build_drilldown_session_level(raw: pd.DataFrame, top_keys: pd.DataFrame) -> 
             "error_rate_dd": np.nan,
             "rate_limited_rate_dd": np.nan,
             "route_skew": route_skew,
+            "route_skew_pct": f"{route_skew:.0%}" if pd.notna(route_skew) else "",
             "burst_score": np.nan,
             "max_events_in_30s": np.nan,
             "p50_gap_s": np.nan,
@@ -555,20 +522,7 @@ def score_with_isolation_forest(df: pd.DataFrame) -> tuple[pd.DataFrame, list[st
     return df, feature_cols
 
 
-# =========================
-# Post-merge explanation: tags + ranked why
-# =========================
 def add_risk_tags_and_ranked_why(top: pd.DataFrame) -> pd.DataFrame:
-    """
-    (2) signals: burst_score, route_skew (already computed in drilldown)
-    (3) why priority order:
-        error_rate
-        volume/burst
-        duration
-        token heavy
-        route skew
-    + tags
-    """
     top = top.copy()
 
     def fmt_pct(x):
@@ -581,13 +535,9 @@ def add_risk_tags_and_ranked_why(top: pd.DataFrame) -> pd.DataFrame:
         tags = []
         why = []
 
-        n = r.get("n_events_dd", np.nan)
-        if pd.isna(n):
-            n = r.get("n_events", np.nan)
-
-        # 1) error/rate-limit signals
         er = r.get("error_rate_dd", np.nan)
         rl = r.get("rate_limited_rate_dd", np.nan)
+
         if pd.notna(er) and er >= 0.20:
             tags.append("ERROR_HEAVY")
             why.append(f"error_rate={fmt_pct(er)}")
@@ -595,7 +545,6 @@ def add_risk_tags_and_ranked_why(top: pd.DataFrame) -> pd.DataFrame:
             tags.append("RATE_LIMIT_HEAVY")
             why.append(f"rate_limited_rate={fmt_pct(rl)}")
 
-        # 2) volume/burst
         max30 = r.get("max_events_in_30s", np.nan)
         bs = r.get("burst_score", np.nan)
         if pd.notna(max30) and max30 >= 20:
@@ -605,25 +554,21 @@ def add_risk_tags_and_ranked_why(top: pd.DataFrame) -> pd.DataFrame:
             tags.append("BURST_DENSE")
             why.append(f"burst_score={bs:.2f}")
 
-        # 3) duration
         dur = r.get("duration_s", np.nan)
-        if pd.notna(dur) and dur >= 1800:  # 30분 이상이면 표시(연구용 기본값)
+        if pd.notna(dur) and dur >= 1800:
             tags.append("LONG_DURATION")
             why.append(f"duration_s={dur:.0f}")
 
-        # 4) token heavy (여기서 token은 네 raw "token" 카테고리/버킷이지만)
         utok = r.get("n_tokens_dd", np.nan)
         if pd.notna(utok) and utok >= 10:
             tags.append("TOKEN_DIVERSE")
             why.append(f"n_unique_tokens={int(utok)}")
 
-        # 5) route skew
         rs = r.get("route_skew", np.nan)
         if pd.notna(rs) and rs >= 0.90:
             tags.append("ROUTE_SKEW")
             why.append(f"route_skew={rs:.0%}")
 
-        # 보강: why_top5를 뒤에 붙이되, 너무 길면 앞부분만
         wt = r.get("why_top5", "")
         if isinstance(wt, str) and wt.strip():
             why.append(f"features: {wt}")
@@ -653,6 +598,9 @@ def main():
 
     ap.add_argument("--inspect-parquet", default=None, help="Print schema/head of parquet file then exit")
 
+    # (C) optional token normalization
+    ap.add_argument("--normalize-token", type=int, default=None, help="1 to normalize token strings (optional)")
+
     args = ap.parse_args()
 
     if args.inspect_parquet:
@@ -667,6 +615,7 @@ def main():
     topk = env("TOPK", args.topk or 100, cast=int)
     save_csv = env("SAVE_CSV", args.save_csv if args.save_csv is not None else 1, cast=int)
     save_parquet = env("SAVE_PARQUET", args.save_parquet if args.save_parquet is not None else 1, cast=int)
+    normalize_token = env("NORMALIZE_TOKEN", args.normalize_token if args.normalize_token is not None else 0, cast=int)
 
     out_path = ensure_dir(out_dir)
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -683,17 +632,12 @@ def main():
         print("[INFO] features parquet empty.")
         return
 
-    # score
     df = add_duration(df)
     df_scored, feature_cols = score_with_isolation_forest(df)
-
-    # explanation: why_top5 (stable)
     df_scored = add_why_top5(df_scored, feature_cols, topn=5)
 
-    # top-k selection
     top = df_scored.sort_values(["risk_pct", "risk_score"], ascending=False).head(topk).copy()
 
-    # drilldown
     dd = pd.DataFrame()
     if raw_path.exists():
         print(f"[INFO] Loading raw for drilldown: {raw_path}")
@@ -710,22 +654,20 @@ def main():
                     dd = build_drilldown_event_level(raw, top)
                 elif is_packed_session_raw(raw):
                     print("[INFO] raw looks PACKED session-level (arrays). Exploding then building event-level drilldown.")
-                    dd = build_drilldown_from_packed_raw(raw, top)
+                    dd = build_drilldown_from_packed_raw(raw, top, normalize_token=bool(normalize_token))
                 else:
                     print("[WARN] raw looks SESSION-level (1 row per session, no arrays). Building fallback drilldown.")
                     dd = build_drilldown_session_level(raw, top)
     else:
         print(f"[WARN] raw parquet not found: {raw_path} (drilldown will be empty)")
 
-    # merge drilldown summaries into top summary
     if not dd.empty:
         top = top.merge(dd, on=KEY_COLS, how="left")
     else:
-        # placeholders
         for c in [
             "n_events_dd", "n_tokens_dd", "n_outcomes_dd",
             "error_rate_dd", "rate_limited_rate_dd",
-            "route_skew", "burst_score",
+            "route_skew", "route_skew_pct", "burst_score",
             "max_events_in_30s", "p50_gap_s", "p95_gap_s",
             "dt_bucket_top3",
             "route_group_top3", "outcome_top3", "token_top3",
@@ -735,17 +677,15 @@ def main():
             if c not in top.columns:
                 top[c] = np.nan if (c.endswith("_dd") or c.endswith("_rate_dd") or c.endswith("_s") or c.startswith("peak_") or c in ["route_skew","burst_score","max_events_in_30s"]) else ""
 
-    # post-merge: tags + ranked why (priority)
     top = add_risk_tags_and_ranked_why(top)
 
-    # summary columns
     summary_cols = [
         "risk_pct", "risk_score", "anomaly_score",
         "user_id", "client_name", "session_key",
         "n_events", "duration_s",
         "n_events_dd", "n_tokens_dd", "n_outcomes_dd",
         "error_rate_dd", "rate_limited_rate_dd",
-        "burst_score", "route_skew",
+        "burst_score", "route_skew_pct",
         "max_events_in_30s", "p50_gap_s", "p95_gap_s",
         "dt_bucket_top3",
         "route_group_top3", "outcome_top3", "token_top3",
@@ -757,7 +697,6 @@ def main():
     summary_cols = [c for c in summary_cols if c in top.columns]
     summary = top[summary_cols].copy()
 
-    # output files
     base = f"{day}_{run_id}"
     summary_csv = out_path / f"trackA_summary_top_{base}.csv"
     drill_csv = out_path / f"trackA_drilldown_{base}.csv"
@@ -777,7 +716,6 @@ def main():
             dd2 = dd.merge(top[KEY_COLS + ["risk_pct", "risk_score"]], on=KEY_COLS, how="left") if "risk_score" in top.columns else dd
             dd2.to_parquet(out_path / f"trackA_drilldown_{base}.parquet", index=False)
 
-    # console print
     print("\n=== TOP-K SUMMARY (human-friendly) ===\n")
     print(summary.head(min(30, len(summary))).to_string(index=False))
 
@@ -789,7 +727,7 @@ def main():
             "user_id", "client_name", "session_key",
             "n_events_dd",
             "error_rate_dd", "rate_limited_rate_dd",
-            "burst_score", "route_skew",
+            "burst_score", "route_skew_pct",
             "max_events_in_30s", "p50_gap_s", "p95_gap_s",
             "peak_30s_events", "peak_30s_start", "peak_30s_end",
             "dt_bucket_top3",
