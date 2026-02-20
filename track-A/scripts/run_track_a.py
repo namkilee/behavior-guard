@@ -77,50 +77,76 @@ def add_duration(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def robust_z(df: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
+def robust_stats(df: pd.DataFrame, feature_cols: list[str]):
     X = df[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0).astype(float)
     med = X.median(axis=0)
-    mad = (X.sub(med)).abs().median(axis=0).replace(0, 1e-9)
-    z = (X.sub(med)).div(mad)
-    return z
+    mad = (X.sub(med)).abs().median(axis=0)
+    return X, med, mad
 
 
 def add_why_top5(df: pd.DataFrame, feature_cols: list[str], topn: int = 5) -> pd.DataFrame:
     """
-    기존 로직(robust z-score)은 유지하되,
-    출력 포맷을 사람이 읽기 쉽게:
-      feature=value (med=..., z=...)
-    형태로 개선
+    기존 robust z-score 기반이지만,
+    MAD=0(거의 대부분 0인 count feature)에서 z가 폭발하는 문제를 해결:
+      - med==0 & mad==0 & value>0  =>  rare_nonzero로 표시
+      - 그 외는 z = (x-med)/(mad or 1e-9)
+    출력 포맷:
+      feature=value (med=..., z=...)  또는  feature=value (rare_nonzero)
     """
     df = df.copy()
     if not feature_cols:
         df["why_top5"] = ""
         return df
 
-    X = df[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0).astype(float)
-    med = X.median(axis=0)
-    mad = (X.sub(med)).abs().median(axis=0).replace(0, 1e-9)
-    z = (X.sub(med)).div(mad)
+    X, med, mad = robust_stats(df, feature_cols)
+
+    # z 계산(안전)
+    mad_safe = mad.replace(0, np.nan)
+    z = (X.sub(med)).div(mad_safe)
+    z = z.replace([np.inf, -np.inf], np.nan)
 
     why = []
     for i in range(len(df)):
-        s = z.iloc[i]
-        top = s.abs().sort_values(ascending=False).head(topn).index.tolist()
+        row = X.iloc[i]
+        zrow = z.iloc[i]
+
+        # rare_nonzero 후보(대부분 0인데 이 row만 0이 아님)
+        rare = []
+        for k in feature_cols:
+            if (med[k] == 0) and (mad[k] == 0) and (row[k] != 0):
+                rare.append(k)
+
+        # z 기반 top (rare는 z가 NaN일 수 있으니 별도로)
+        zabs = zrow.abs().fillna(0.0)
+        top_z = zabs.sort_values(ascending=False).head(topn).index.tolist()
+
+        # 우선: rare_nonzero를 앞쪽에 배치(최대 topn까지만)
+        picked = []
+        for k in rare:
+            if len(picked) >= topn:
+                break
+            picked.append(k)
+        for k in top_z:
+            if len(picked) >= topn:
+                break
+            if k not in picked:
+                picked.append(k)
+
         parts = []
-        for k in top:
-            parts.append(f"{k}={X.iloc[i][k]:.2f} (med={med[k]:.2f}, z={s[k]:+.2f})")
+        for k in picked:
+            if (med[k] == 0) and (mad[k] == 0) and (row[k] != 0):
+                parts.append(f"{k}={row[k]:.2f} (rare_nonzero)")
+            else:
+                zv = zrow[k]
+                if pd.isna(zv):
+                    # z를 계산할 수 없으면 간단 표기
+                    parts.append(f"{k}={row[k]:.2f} (med={med[k]:.2f})")
+                else:
+                    parts.append(f"{k}={row[k]:.2f} (med={med[k]:.2f}, z={zv:+.2f})")
+
         why.append("; ".join(parts))
+
     df["why_top5"] = why
-    return df
-
-
-def add_error_rate_from_outcome(df: pd.DataFrame, outcome_col="outcome_class") -> pd.DataFrame:
-    df = df.copy()
-    if outcome_col not in df.columns:
-        return df
-    s = df[outcome_col].astype(str)
-    is_err = s.str.contains("fail|error|deny|blocked|429|5xx", case=False, regex=True)
-    df["is_error"] = is_err
     return df
 
 
@@ -146,7 +172,7 @@ def is_list_like(x) -> bool:
 def is_packed_session_raw(raw: pd.DataFrame) -> bool:
     """
     세션당 1행인데 이벤트가 array/list로 들어있는 형태인지 감지.
-    예: tokens/outcomes/route_groups/event_times/dt_buckets 가 object(list)로 존재.
+    예: tokens/outcomes/route_groups/event_times/dt_buckets
     """
     for c in KEY_COLS:
         if c not in raw.columns:
@@ -176,8 +202,10 @@ def parse_maybe_list(x):
         s = x.strip()
         if s == "":
             return []
+        # 아주 단순: "a,b,c"
         if "," in s and "[" not in s and "{" not in s:
             return [t.strip() for t in s.split(",") if t.strip()]
+        # JSON-like list
         if (s.startswith("[") and s.endswith("]")):
             try:
                 import json
@@ -241,8 +269,56 @@ def explode_packed_raw(raw: pd.DataFrame) -> pd.DataFrame:
     return ev
 
 
+def _peak_window_30s(t: pd.Series, window_s: int = 30):
+    """
+    t: datetime series sorted/cleaned inside
+    returns (start_ts, end_ts, max_count)
+    """
+    if t is None:
+        return (pd.NaT, pd.NaT, 0)
+    tt = pd.to_datetime(t.dropna(), errors="coerce").dropna().sort_values()
+    if len(tt) == 0:
+        return (pd.NaT, pd.NaT, 0)
+    if len(tt) == 1:
+        return (tt.iloc[0], tt.iloc[0], 1)
+
+    arr = tt.values.astype("datetime64[ns]")
+    win = np.timedelta64(window_s, "s")
+    j = 0
+    best_i = 0
+    best_j = 0
+    best = 1
+    for i in range(len(arr)):
+        while arr[i] - arr[j] > win:
+            j += 1
+        c = i - j + 1
+        if c > best:
+            best = c
+            best_i = i
+            best_j = j
+    start = tt.iloc[best_j]
+    end = tt.iloc[best_i]
+    return (start, end, int(best))
+
+
+def _fmt_ts(ts):
+    if ts is None or pd.isna(ts):
+        return ""
+    # 초 단위까지만
+    try:
+        return pd.to_datetime(ts).strftime("%H:%M:%S")
+    except Exception:
+        return str(ts)
+
+
 def build_drilldown_event_level(raw: pd.DataFrame, top_keys: pd.DataFrame) -> pd.DataFrame:
-    # raw: 이벤트/관측치 1행 = 1 event 가정
+    """
+    이벤트 레벨 raw 또는 explode된 이벤트 raw를 받아 drilldown을 생성.
+    요구사항(2~4):
+      - burst_score, route_skew
+      - timeline_1line
+      - top_error_route
+    """
     for c in KEY_COLS:
         if c not in raw.columns:
             raise ValueError(f"raw missing required key column: {c}")
@@ -253,50 +329,113 @@ def build_drilldown_event_level(raw: pd.DataFrame, top_keys: pd.DataFrame) -> pd
 
     time_col = guess_time_col(filt)
 
-    def burst_metrics(ts: pd.Series, window_s: int = 30) -> dict:
-        out = {"max_events_in_30s": np.nan, "p50_gap_s": np.nan, "p95_gap_s": np.nan}
-        if ts is None or ts.isna().all():
-            return out
-        t = pd.to_datetime(ts.dropna(), errors="coerce").dropna().sort_values()
-        if len(t) < 2:
-            out["max_events_in_30s"] = float(len(t))
-            return out
-
-        gaps = (t.diff().dt.total_seconds()).dropna()
-        if len(gaps):
-            out["p50_gap_s"] = float(np.quantile(gaps, 0.50))
-            out["p95_gap_s"] = float(np.quantile(gaps, 0.95))
-
-        arr = t.values.astype("datetime64[ns]")
-        j = 0
-        maxc = 1
-        win = np.timedelta64(window_s, "s")
-        for i in range(len(arr)):
-            while arr[i] - arr[j] > win:
-                j += 1
-            maxc = max(maxc, i - j + 1)
-        out["max_events_in_30s"] = float(maxc)
-        return out
-
     def agg_group(g: pd.DataFrame) -> pd.Series:
-        out = {
-            "n_events_dd": int(len(g)),
-            "n_tokens_dd": int(g["token"].nunique()) if "token" in g.columns else np.nan,
-            "n_outcomes_dd": int(g["outcome_class"].nunique()) if "outcome_class" in g.columns else np.nan,
-            "token_top3": topk_str(g["token"], 3) if "token" in g.columns else "",
-            "route_group_top3": topk_str(g["route_group"], 3) if "route_group" in g.columns else "",
-            "outcome_top3": topk_str(g["outcome_class"], 3) if "outcome_class" in g.columns else "",
-            "dt_bucket_top3": topk_str(g["dt_bucket"], 3) if "dt_bucket" in g.columns else "",
-        }
-        if time_col:
-            out["first_ts"] = g[time_col].min()
-            out["last_ts"] = g[time_col].max()
-            out.update(burst_metrics(g[time_col], window_s=30))
+        n = int(len(g))
+
+        # Top3 strings
+        token_top3 = topk_str(g["token"], 3) if "token" in g.columns else ""
+        route_top3 = topk_str(g["route_group"], 3) if "route_group" in g.columns else ""
+        outcome_top3 = topk_str(g["outcome_class"], 3) if "outcome_class" in g.columns else ""
+        dt_top3 = topk_str(g["dt_bucket"], 3) if "dt_bucket" in g.columns else ""
+
+        # Counts/ratios
+        error_rate = np.nan
+        rate_limited_rate = np.nan
+        top_error_route = ""
+        top1_route_ratio = np.nan
 
         if "outcome_class" in g.columns:
             s = g["outcome_class"].astype(str)
             is_err = s.str.contains("fail|error|deny|blocked|429|5xx", case=False, regex=True)
-            out["error_rate_dd"] = float(is_err.mean())
+            error_rate = float(is_err.mean())
+
+            is_rl = s.str.contains("rate_limited|429", case=False, regex=True)
+            rate_limited_rate = float(is_rl.mean())
+
+            # top_error_route: 에러가 가장 많은 route_group
+            if "route_group" in g.columns:
+                err_g = g.loc[is_err, "route_group"]
+                if len(err_g):
+                    vc = err_g.value_counts(dropna=True)
+                    if len(vc):
+                        top_error_route = f"{vc.index[0]}({int(vc.iloc[0])})"
+
+        if "route_group" in g.columns and n > 0:
+            vc = g["route_group"].value_counts(dropna=True)
+            if len(vc):
+                top1_route_ratio = float(vc.iloc[0] / n)
+
+        # Time/burst
+        first_ts = pd.NaT
+        last_ts = pd.NaT
+        peak_start = pd.NaT
+        peak_end = pd.NaT
+        peak_events = 0
+        max_events_in_30s = np.nan
+        p50_gap_s = np.nan
+        p95_gap_s = np.nan
+
+        if time_col and time_col in g.columns:
+            tt = pd.to_datetime(g[time_col], errors="coerce")
+            first_ts = tt.min()
+            last_ts = tt.max()
+
+            # gaps
+            t_sorted = tt.dropna().sort_values()
+            if len(t_sorted) >= 2:
+                gaps = t_sorted.diff().dt.total_seconds().dropna()
+                if len(gaps):
+                    p50_gap_s = float(np.quantile(gaps, 0.50))
+                    p95_gap_s = float(np.quantile(gaps, 0.95))
+            # peak window
+            peak_start, peak_end, peak_events = _peak_window_30s(t_sorted, window_s=30)
+            max_events_in_30s = float(peak_events)
+
+        # signals
+        route_skew = float(top1_route_ratio) if pd.notna(top1_route_ratio) else np.nan
+        burst_score = float(max_events_in_30s / (n + 1e-9)) if pd.notna(max_events_in_30s) else np.nan
+
+        # timeline 1-line
+        tl_parts = []
+        if pd.notna(first_ts) and pd.notna(last_ts):
+            tl_parts.append(f"span={_fmt_ts(first_ts)}~{_fmt_ts(last_ts)}")
+        if peak_events and pd.notna(peak_start) and pd.notna(peak_end):
+            tl_parts.append(f"peak30s={peak_events}@{_fmt_ts(peak_start)}~{_fmt_ts(peak_end)}")
+        if top_error_route:
+            tl_parts.append(f"top_error_route={top_error_route}")
+        if pd.notna(error_rate):
+            tl_parts.append(f"error_rate={error_rate:.0%}")
+        if pd.notna(rate_limited_rate):
+            tl_parts.append(f"rate_limited_rate={rate_limited_rate:.0%}")
+        timeline_1line = " | ".join(tl_parts)
+
+        out = {
+            "n_events_dd": n,
+            "n_tokens_dd": int(pd.Series(g["token"]).dropna().nunique()) if "token" in g.columns else np.nan,
+            "n_outcomes_dd": int(pd.Series(g["outcome_class"]).dropna().nunique()) if "outcome_class" in g.columns else np.nan,
+            "token_top3": token_top3,
+            "route_group_top3": route_top3,
+            "outcome_top3": outcome_top3,
+            "dt_bucket_top3": dt_top3,
+
+            "error_rate_dd": error_rate,
+            "rate_limited_rate_dd": rate_limited_rate,
+
+            "route_skew": route_skew,
+            "burst_score": burst_score,
+
+            "first_ts": first_ts,
+            "last_ts": last_ts,
+            "peak_30s_start": peak_start,
+            "peak_30s_end": peak_end,
+            "peak_30s_events": int(peak_events) if peak_events else 0,
+            "max_events_in_30s": max_events_in_30s,
+            "p50_gap_s": p50_gap_s,
+            "p95_gap_s": p95_gap_s,
+
+            "top_error_route": top_error_route,
+            "timeline_1line": timeline_1line,
+        }
         return pd.Series(out)
 
     dd = filt.groupby(KEY_COLS, dropna=False).apply(agg_group).reset_index()
@@ -304,13 +443,7 @@ def build_drilldown_event_level(raw: pd.DataFrame, top_keys: pd.DataFrame) -> pd
 
 
 def build_drilldown_from_packed_raw(raw: pd.DataFrame, top_keys: pd.DataFrame) -> pd.DataFrame:
-    """
-    packed session raw(세션 1행 + 배열)을 explode해서 이벤트 레벨로 바꾼 뒤,
-    event-level drilldown 집계를 수행.
-    """
     ev = explode_packed_raw(raw)
-
-    # ev는 이제 event-level처럼 보일 수 있으니 그대로 집계
     return build_drilldown_event_level(ev, top_keys)
 
 
@@ -336,6 +469,13 @@ def build_drilldown_session_level(raw: pd.DataFrame, top_keys: pd.DataFrame) -> 
         outs = parse_maybe_list(r[outcome_col]) if outcome_col else []
         routes = parse_maybe_list(r[route_col]) if route_col else []
 
+        # 간이 route_skew 추정
+        route_skew = np.nan
+        if routes:
+            c = Counter([x for x in routes if x is not None])
+            top1 = c.most_common(1)[0][1] if c else 0
+            route_skew = float(top1 / (len(routes) + 1e-9))
+
         row = {
             "user_id": r["user_id"],
             "client_name": r["client_name"],
@@ -347,15 +487,23 @@ def build_drilldown_session_level(raw: pd.DataFrame, top_keys: pd.DataFrame) -> 
             "route_group_top3": topk_str(routes, 3) if routes else "",
             "outcome_top3": topk_str(outs, 3) if outs else "",
             "dt_bucket_top3": "",
+            "error_rate_dd": np.nan,
+            "rate_limited_rate_dd": np.nan,
+            "route_skew": route_skew,
+            "burst_score": np.nan,
             "max_events_in_30s": np.nan,
             "p50_gap_s": np.nan,
             "p95_gap_s": np.nan,
+            "top_error_route": "",
+            "timeline_1line": "",
         }
 
         if outs:
             s = pd.Series([str(x) for x in outs])
             is_err = s.str.contains("fail|error|deny|blocked|429|5xx", case=False, regex=True)
+            is_rl = s.str.contains("rate_limited|429", case=False, regex=True)
             row["error_rate_dd"] = float(is_err.mean())
+            row["rate_limited_rate_dd"] = float(is_rl.mean())
         rows.append(row)
 
     return pd.DataFrame(rows)
@@ -370,7 +518,7 @@ def score_with_isolation_forest(df: pd.DataFrame) -> tuple[pd.DataFrame, list[st
     id_candidates = ["user_id", "client_name", "session_key", "session_start", "session_end"]
     id_cols = [c for c in id_candidates if c in df.columns]
 
-    exclude = set(id_cols + ["anomaly_score", "risk_score", "risk_pct", "duration_s", "why_top5"])
+    exclude = set(id_cols + ["anomaly_score", "risk_score", "risk_pct", "duration_s", "why_top5", "why_ranked", "risk_tags"])
     feature_cols = [c for c in df.columns if c not in exclude]
 
     if not feature_cols:
@@ -407,6 +555,90 @@ def score_with_isolation_forest(df: pd.DataFrame) -> tuple[pd.DataFrame, list[st
     return df, feature_cols
 
 
+# =========================
+# Post-merge explanation: tags + ranked why
+# =========================
+def add_risk_tags_and_ranked_why(top: pd.DataFrame) -> pd.DataFrame:
+    """
+    (2) signals: burst_score, route_skew (already computed in drilldown)
+    (3) why priority order:
+        error_rate
+        volume/burst
+        duration
+        token heavy
+        route skew
+    + tags
+    """
+    top = top.copy()
+
+    def fmt_pct(x):
+        return "" if pd.isna(x) else f"{x:.0%}"
+
+    tags_list = []
+    why_ranked = []
+
+    for _, r in top.iterrows():
+        tags = []
+        why = []
+
+        n = r.get("n_events_dd", np.nan)
+        if pd.isna(n):
+            n = r.get("n_events", np.nan)
+
+        # 1) error/rate-limit signals
+        er = r.get("error_rate_dd", np.nan)
+        rl = r.get("rate_limited_rate_dd", np.nan)
+        if pd.notna(er) and er >= 0.20:
+            tags.append("ERROR_HEAVY")
+            why.append(f"error_rate={fmt_pct(er)}")
+        if pd.notna(rl) and rl >= 0.20:
+            tags.append("RATE_LIMIT_HEAVY")
+            why.append(f"rate_limited_rate={fmt_pct(rl)}")
+
+        # 2) volume/burst
+        max30 = r.get("max_events_in_30s", np.nan)
+        bs = r.get("burst_score", np.nan)
+        if pd.notna(max30) and max30 >= 20:
+            tags.append("BURST")
+            why.append(f"burst_peak30s={int(max30)}")
+        elif pd.notna(bs) and bs >= 0.05:
+            tags.append("BURST_DENSE")
+            why.append(f"burst_score={bs:.2f}")
+
+        # 3) duration
+        dur = r.get("duration_s", np.nan)
+        if pd.notna(dur) and dur >= 1800:  # 30분 이상이면 표시(연구용 기본값)
+            tags.append("LONG_DURATION")
+            why.append(f"duration_s={dur:.0f}")
+
+        # 4) token heavy (여기서 token은 네 raw "token" 카테고리/버킷이지만)
+        utok = r.get("n_tokens_dd", np.nan)
+        if pd.notna(utok) and utok >= 10:
+            tags.append("TOKEN_DIVERSE")
+            why.append(f"n_unique_tokens={int(utok)}")
+
+        # 5) route skew
+        rs = r.get("route_skew", np.nan)
+        if pd.notna(rs) and rs >= 0.90:
+            tags.append("ROUTE_SKEW")
+            why.append(f"route_skew={rs:.0%}")
+
+        # 보강: why_top5를 뒤에 붙이되, 너무 길면 앞부분만
+        wt = r.get("why_top5", "")
+        if isinstance(wt, str) and wt.strip():
+            why.append(f"features: {wt}")
+
+        tags_list.append(",".join(tags))
+        why_ranked.append(" | ".join(why))
+
+    top["risk_tags"] = tags_list
+    top["why_ranked"] = why_ranked
+    return top
+
+
+# =========================
+# Main
+# =========================
 def main():
     ap = argparse.ArgumentParser(description="BehaviorGuard Track A (Parquet-first) with Explanation Layer")
     ap.add_argument("--day", help="YYYY-MM-DD (pipeline friendly)")
@@ -451,10 +683,14 @@ def main():
         print("[INFO] features parquet empty.")
         return
 
+    # score
     df = add_duration(df)
     df_scored, feature_cols = score_with_isolation_forest(df)
+
+    # explanation: why_top5 (stable)
     df_scored = add_why_top5(df_scored, feature_cols, topn=5)
 
+    # top-k selection
     top = df_scored.sort_values(["risk_pct", "risk_score"], ascending=False).head(topk).copy()
 
     # drilldown
@@ -481,32 +717,47 @@ def main():
     else:
         print(f"[WARN] raw parquet not found: {raw_path} (drilldown will be empty)")
 
+    # merge drilldown summaries into top summary
     if not dd.empty:
         top = top.merge(dd, on=KEY_COLS, how="left")
     else:
+        # placeholders
         for c in [
-            "n_events_dd", "n_tokens_dd", "n_outcomes_dd", "error_rate_dd",
+            "n_events_dd", "n_tokens_dd", "n_outcomes_dd",
+            "error_rate_dd", "rate_limited_rate_dd",
+            "route_skew", "burst_score",
             "max_events_in_30s", "p50_gap_s", "p95_gap_s",
             "dt_bucket_top3",
-            "route_group_top3", "outcome_top3", "token_top3"
+            "route_group_top3", "outcome_top3", "token_top3",
+            "timeline_1line", "top_error_route",
+            "peak_30s_start", "peak_30s_end", "peak_30s_events",
         ]:
             if c not in top.columns:
-                top[c] = np.nan if c.endswith("_dd") or c.endswith("_rate_dd") or c.endswith("_s") else ""
+                top[c] = np.nan if (c.endswith("_dd") or c.endswith("_rate_dd") or c.endswith("_s") or c.startswith("peak_") or c in ["route_skew","burst_score","max_events_in_30s"]) else ""
 
+    # post-merge: tags + ranked why (priority)
+    top = add_risk_tags_and_ranked_why(top)
+
+    # summary columns
     summary_cols = [
         "risk_pct", "risk_score", "anomaly_score",
         "user_id", "client_name", "session_key",
         "n_events", "duration_s",
         "n_events_dd", "n_tokens_dd", "n_outcomes_dd",
-        "error_rate_dd",
+        "error_rate_dd", "rate_limited_rate_dd",
+        "burst_score", "route_skew",
         "max_events_in_30s", "p50_gap_s", "p95_gap_s",
         "dt_bucket_top3",
         "route_group_top3", "outcome_top3", "token_top3",
-        "why_top5",
+        "top_error_route",
+        "risk_tags",
+        "timeline_1line",
+        "why_ranked",
     ]
     summary_cols = [c for c in summary_cols if c in top.columns]
     summary = top[summary_cols].copy()
 
+    # output files
     base = f"{day}_{run_id}"
     summary_csv = out_path / f"trackA_summary_top_{base}.csv"
     drill_csv = out_path / f"trackA_drilldown_{base}.csv"
@@ -526,6 +777,7 @@ def main():
             dd2 = dd.merge(top[KEY_COLS + ["risk_pct", "risk_score"]], on=KEY_COLS, how="left") if "risk_score" in top.columns else dd
             dd2.to_parquet(out_path / f"trackA_drilldown_{base}.parquet", index=False)
 
+    # console print
     print("\n=== TOP-K SUMMARY (human-friendly) ===\n")
     print(summary.head(min(30, len(summary))).to_string(index=False))
 
@@ -535,10 +787,15 @@ def main():
         cols = [c for c in [
             "risk_pct", "risk_score",
             "user_id", "client_name", "session_key",
-            "n_events_dd", "error_rate_dd",
+            "n_events_dd",
+            "error_rate_dd", "rate_limited_rate_dd",
+            "burst_score", "route_skew",
             "max_events_in_30s", "p50_gap_s", "p95_gap_s",
+            "peak_30s_events", "peak_30s_start", "peak_30s_end",
             "dt_bucket_top3",
             "route_group_top3", "outcome_top3", "token_top3",
+            "top_error_route",
+            "timeline_1line",
             "first_ts", "last_ts"
         ] if c in show.columns]
         print(show[cols].head(20).to_string(index=False))
