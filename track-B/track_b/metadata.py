@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import os
 import subprocess
@@ -26,21 +25,12 @@ def build_run_metadata(
     n_rows_events: int,
 ) -> Dict[str, Any]:
     return {
-        "behaviorguard": {
-            "track": track,
-            "track_version": track_version,
-            "mode": "research",
-        },
+        "behaviorguard": {"track": track, "track_version": track_version, "mode": "research"},
         "runtime": {
             "utc_started_at": datetime.now(timezone.utc).isoformat(),
             "hostname": os.uname().nodename if hasattr(os, "uname") else None,
             "git_commit": _try_git_commit(),
         },
-        "io": {
-            "input_path": input_path,
-            "outdir": outdir,
-            "n_rows_input": n_rows_input,
-            "n_rows_events": n_rows_events,
-        },
+        "io": {"input_path": input_path, "outdir": outdir, "n_rows_input": n_rows_input, "n_rows_events": n_rows_events},
         "args": args,
     }
