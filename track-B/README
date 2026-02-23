@@ -1,0 +1,233 @@
+# BehaviorGuard Track B v0.1 — Technical Specification (Frozen for Research)
+
+Status: Frozen for Research Implementation
+Scope: Shallow Sequence Models (Markov / N-gram / Entropy)
+Applies To: Research Phase Only
+Timezone: Asia/Seoul
+Generated At: 2026-02-20T21:08:39.656934+09:00
+
+This document defines Track B (Shallow Sequence) under Research Mode.
+Any change requires version bump.
+
+---
+
+0. Purpose
+
+Track B models event-level behavioral sequences directly, without collapsing them into aggregate features.
+
+Unlike Track A (statistical feature model), Track B operates on ordered event symbols.
+
+Track B MUST:
+- Use the same identity join keys as Track A
+- Produce the same Summary/Drilldown output contract
+- Follow the unified Evaluation Protocol v1.0
+
+---
+
+1. Identity Contract (Mandatory)
+
+All outputs MUST include:
+
+(project_id, day, user_id_norm, session_id_norm)
+
+These keys MUST be identical to Track A.
+
+---
+
+2. Sequence Token Definition (Frozen v0.1)
+
+2.1 Event Symbol
+
+Each event token is defined as:
+
+    "{route_group}:{normalized_outcome}"
+
+Examples:
+
+    /chat:ok
+    /chat:error
+    /chat:rate_limited
+
+Outcome normalization MUST follow Track A rules.
+
+2.2 Ordering
+
+Events MUST be ordered by:
+
+    event_time ASC, observation_id ASC
+
+This ordering MUST match Track A explode ordering for consistency.
+
+---
+
+3. Models Included in Track B
+
+Track B includes three shallow sequence models:
+
+- B1: First-order Markov Negative Log-Likelihood
+- B2: N-gram Rarity Score (Bigram/Trigram)
+- B3: Sequence Entropy Deviation
+
+Each model produces a raw anomaly score.
+
+All raw scores MUST follow:
+
+    Higher score = More anomalous
+
+---
+
+4. B1 — First-Order Markov Model
+
+4.1 Global Transition Table
+
+Compute global transition probabilities:
+
+    P(x_t | x_(t-1))
+
+using all sessions in the same partition (project_id, day).
+
+Apply Laplace smoothing (add-1) to avoid zero probabilities.
+
+4.2 Session Score
+
+For session sequence x1...xT:
+
+    seq_raw = - Σ log P(x_t | x_(t-1))
+
+Properties:
+- Rare transitions increase score
+- Frequent transitions decrease score
+- Higher score = more anomalous
+
+---
+
+5. B2 — N-gram Rarity Score
+
+5.1 N-gram Frequency Table
+
+Compute frequency counts for:
+- Bigram (n=2)
+- Trigram (n=3)
+
+within same partition.
+
+5.2 Rarity Score
+
+For each session:
+
+    rarity = Σ -log P(ngram)
+
+Where P(ngram) = frequency / total_ngrams (with smoothing).
+
+Final score:
+
+    seq_raw = rarity
+
+Higher score = more anomalous.
+
+---
+
+6. B3 — Sequence Entropy Deviation
+
+6.1 Session Entropy
+
+For each session, compute Shannon entropy over token distribution:
+
+    H_session = - Σ p_i log p_i
+
+6.2 Partition Reference
+
+Compute median entropy within partition:
+
+    H_med
+
+6.3 Deviation Score
+
+    seq_raw = |H_session - H_med|
+
+Higher deviation from typical entropy = more anomalous.
+
+---
+
+7. Score Normalization (Cross-Track Compatibility)
+
+Each model's raw score MUST be converted to:
+
+    risk_score_seq (0–100 scale)
+
+Using percentile normalization within partition:
+
+    risk_score_seq = 100 * clip01((seq_raw - p50) / (p95 - p50))
+
+If p95 == p50 then risk_score_seq = 0.
+
+---
+
+8. Output Contract (Mandatory)
+
+Track B MUST output:
+
+8.1 Summary
+
+- day
+- project_id
+- user_id_norm
+- session_id_norm
+- rank
+- seq_raw
+- risk_score_seq
+- model_type (B1 / B2 / B3)
+- primary_reason_code (model-specific)
+- timeline_1line (same format as Track A)
+
+8.2 Drilldown
+
+- component_breakdown
+- transition_counts (B1)
+- rare_ngrams (B2)
+- entropy_values (B3)
+- timeline (full token sequence)
+
+---
+
+9. Ranking Rule
+
+Within each partition:
+
+    ORDER BY seq_raw DESC, session_id_norm ASC
+
+K = 200 (default)
+
+---
+
+10. Evaluation Compliance
+
+Track B MUST report:
+
+- Precision@K_relaxed
+- Top-K Overlap (Directional + Jaccard)
+- Stability across time windows
+- Computational cost
+
+Evaluation MUST follow Research Evaluation Protocol v1.0.
+
+---
+
+11. Determinism Requirements
+
+- Fixed random seed (if randomness used)
+- Stable ordering
+- Smoothing strategy recorded in run_metadata
+- data_fingerprint required
+
+---
+
+12. Version
+
+Version: 0.1
+Phase: Research Mode
+Last Updated: 2026-02-20T21:08:39.656934+09:00
+
+---
+
+End of document.

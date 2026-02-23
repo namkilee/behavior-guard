@@ -1,0 +1,332 @@
+# 1️⃣ Track A 결과 구조 이해
+
+Track A 산출물은 3단 구조야:
+
+```
+① features_scored      → 전체 세션 + anomaly score
+② summary_topK         → 사람이 빠르게 보는 요약판
+③ drilldown_topK       → 세션 내부 구조 상세 분석
+```
+
+---
+
+# 2️⃣ Summary Top-K 컬럼 해석 가이드
+
+Summary는 **"한 눈에 1차 분류"** 용도야.
+여기서 80% 판단을 하고, 애매한 것만 drilldown으로 내려가면 된다.
+
+---
+
+## 📊 핵심 컬럼 의미
+
+### 1. `risk_score`
+
+* IsolationForest anomaly score 기반
+* 낮을수록 이상
+* 👉 **랭킹 기준일 뿐, 판정 기준 아님**
+
+---
+
+### 2. `n_events`
+
+* 세션 전체 이벤트 수
+* 많다고 위험은 아님
+* 👉 `peak30s`와 같이 봐야 의미 있음
+
+---
+
+### 3. `error_rate`
+
+```
+error_count / total_events
+```
+
+해석 가이드:
+
+| 범위     | 해석        |
+| ------ | --------- |
+| 0%     | 정상 가능성 높음 |
+| 1~5%   | 일반적인 실패   |
+| 10~30% | 재시도 패턴    |
+| 40%+   | 폭주 가능성    |
+
+---
+
+### 4. `rate_limited_rate`
+
+```
+rate_limited_count / total_events
+```
+
+이게 높으면:
+
+* 사용자가 정책에 계속 막히고 있음
+* → 자동화/스크립트/오작동 가능성
+
+---
+
+### 5. `max_events_in_30s` (peak30s)
+
+30초 구간 최대 이벤트 수.
+
+이게 핵심이다.
+
+| 값    | 의미     |
+| ---- | ------ |
+| < 5  | 정상     |
+| 5~15 | 활동적    |
+| 20+  | burst  |
+| 40+  | 자동화 의심 |
+
+---
+
+### 6. `duration_sec` (span)
+
+세션 지속 시간.
+
+| 패턴           | 해석       |
+| ------------ | -------- |
+| 짧은 + burst   | 자동화 가능성  |
+| 긴 + 낮은 error | 정상 장기 세션 |
+| 긴 + 높은 error | 반복 실패    |
+
+---
+
+### 7. `route_skew`
+
+특정 route 비율.
+
+```
+max(route_count) / total_events
+```
+
+| 값       | 해석             |
+| ------- | -------------- |
+| ~30-60% | 정상 분산          |
+| 80%+    | 특정 endpoint 집중 |
+| 100%    | 단일 API 반복 호출   |
+
+---
+
+### 8. `risk_tags`
+
+룰 기반 요약 태그:
+
+* `ERROR_HEAVY`
+* `RATE_LIMIT_HEAVY`
+* `BURST`
+* `LONG_DURATION`
+* `ROUTE_SKEW`
+
+👉 이건 사람이 보는 “해석 힌트”다.
+
+---
+
+### 9. `timeline_1line`
+
+예:
+
+```
+span=1120s | peak30s=24 | error_rate=42% | rl_rate=52% | top_error_route=/chat
+```
+
+이 한 줄이면 대부분 판단 가능하다.
+
+---
+
+# 3️⃣ 사람이 Top-K를 보는 순서 (실전 판단 프로세스)
+
+Track A는 “위험 탐지”가 아니라
+**"의심 후보 우선 정렬"** 이다.
+
+그래서 아래 순서로 본다.
+
+---
+
+# ✅ 1단계: 자동화 의심 여부
+
+### 먼저 본다:
+
+* peak30s
+* error_rate
+* rate_limited_rate
+
+### 패턴:
+
+```
+peak30s 높음
++
+error_rate 높음
++
+rate_limited_rate 높음
+```
+
+→ 거의 확실히 자동 재시도 루프
+
+---
+
+# ✅ 2단계: 정상 장기 세션인지 확인
+
+```
+duration 길다
++
+error_rate 낮다
++
+route_skew 높다 (chat 100%)
+```
+
+→ 정상 사용자 장시간 대화 가능성
+
+---
+
+# ✅ 3단계: 정책 회피/공격 가능성
+
+```
+rate_limited_rate 높다
++
+burst 반복
++
+짧은 세션 여러 개
+```
+
+→ 차단 회피 자동화
+
+---
+
+# 4️⃣ 당신이 준 샘플 해석
+
+---
+
+## 🔴 케이스 1
+
+```
+chat 473
+rate_limited 250
+error 200
+peak30s 24
+error_rate ~42%
+```
+
+해석:
+
+* burst 있음
+* rate limit 맞고도 계속 시도
+* 에러율 매우 높음
+* 단일 route 집중
+
+👉 **자동화 재시도 루프 가능성 매우 높음**
+
+이건 거의 Block 후보.
+
+---
+
+## 🟡 케이스 2
+
+```
+chat 355
+rate_limited 18 (5%)
+error 0
+peak30s 18
+route_skew 100%
+span 3h+
+```
+
+해석:
+
+* 장시간 세션
+* 거의 에러 없음
+* 약간 burst 있음
+* 단일 route(chat) 집중은 정상
+
+👉 정상 고활성 사용자 가능성 높음
+→ Warn or Allow
+
+---
+
+# 5️⃣ 언제 Drilldown을 보나?
+
+Summary로 판단이 애매할 때만 본다.
+
+Drilldown에서 확인하는 것:
+
+### 1. route별 error 분포
+
+* 특정 endpoint에서만 실패?
+
+### 2. 시간대 집중
+
+* 5초 안에 몰림?
+
+### 3. 이벤트 패턴
+
+* 일정 간격 반복 → bot
+* 불규칙 → 사람
+
+---
+
+# 6️⃣ 사람이 판단하는 최종 Mental Model
+
+사람은 실제로 이렇게 판단한다:
+
+```
+1. Burst 있는가?
+2. 에러율 높은가?
+3. rate limit 맞고도 계속 시도하는가?
+4. 단일 route 반복인가?
+5. 장기 정상 사용인가?
+```
+
+이 5개만 보면 90% 분류 가능하다.
+
+---
+
+# 7️⃣ Track A의 한계 (중요)
+
+Track A는:
+
+* 세션 단위
+* 하루 단위
+* 컨텍스트 없음
+
+즉:
+
+* 유저 과거 이력 모름
+* IP 다중 여부 모름
+* cross-session 패턴 모름
+
+→ 그래서 “판정”이 아니라 “랭킹”이다.
+
+---
+
+# 8️⃣ BehaviorGuard 관점에서 의미
+
+Track A는:
+
+```
+Decision 전에
+Suspicious Candidates를 뽑는 Filter 단계
+```
+
+실제 시스템에서는:
+
+```
+Log → Feature → Outlier Ranking → Explanation Layer
+    → Policy Engine → allow/warn/block/rate-limit
+```
+
+---
+
+# 🔥 핵심 정리
+
+Summary에서 이 4개만 보면 된다:
+
+```
+peak30s
+error_rate
+rate_limited_rate
+duration
+```
+
+그리고 risk_tags로 빠르게 힌트 얻고
+애매하면 drilldown.
+

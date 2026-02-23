@@ -1,0 +1,721 @@
+# BehaviorGuard Track A v1.0.1 — Technical Specification (Frozen)
+Status: **Frozen for Implementation** • Scope: Research Mode (Offline Ranking + Explanation + Pseudo‑Label Suggestions)
+
+**Spec version:** 1.0.1  
+**Revision:** revised-2026-02-20-frozen-2026-02-20  
+**Timezone:** Asia/Seoul  
+**Generated at:** 2026-02-20T19:58:58.272531+09:00
+
+> This document is the **single source of truth** for Track A v1.0.1 implementation.  
+> Any future changes MUST increment `spec_version` and MUST NOT be applied under this document.
+
+---
+
+## 0. Abstract
+
+Track A is the **Session‑Level Ranking & Explanation Layer** in BehaviorGuard.
+
+It:
+
+1. Ingests **packed session logs** (session rows with event arrays)
+2. Explodes event‑level arrays (**deterministic truncation** on mismatch)
+3. Computes deterministic **session features**
+4. Ranks sessions using **IsolationForest**
+5. Produces **policy‑interpretable risk signals** (`risk_score_v2`)
+6. Emits explainable **Top‑K artifacts** (**Summary + Drilldown**)
+7. Generates **structured pseudo‑label suggestions**
+
+Track A does **not** perform enforcement decisions. Enforcement requires Track B + Policy Engine.
+
+---
+
+## 1. Goals and Non‑Goals
+
+### 1.1 Goals
+
+- Rank anomalous sessions (Top‑K)
+- Provide explainable risk reasoning (**human‑readable** + **machine‑readable**)
+- Generate structured pseudo‑labels for review workflows
+- Produce reproducible research artifacts (inputs, params, fingerprints, code SHA)
+- Act as upstream signal provider for Track B
+
+### 1.2 Non‑Goals
+
+- Real‑time enforcement
+- Cross‑day modeling or drift handling
+- Cross‑session aggregation (user‑level, IP‑level, etc.)
+- IP intelligence / reputation enrichment
+- Identity trust scoring (beyond stable ID normalization)
+- Final allow/warn/block decisions
+
+---
+
+## 2. Identity & Key Normalization (Mandatory)
+
+All outputs MUST include: `(project_id, day, user_id_norm, session_id_norm)`.
+
+### 2.1 `user_id_norm` priority
+
+1. `traces.user_id`
+2. `traces.metadata["user_api_key_user_id"]`
+3. `traces.metadata["user_api_key_end_user_id"]`
+4. Fallback: `"UNKNOWN_USER"`
+
+`null`, empty string, or whitespace‑only values are treated as missing.
+
+### 2.2 `session_id_norm` priority
+
+1. `traces.session_id`
+2. Fallback: `"trace:" + trace_id`
+
+### 2.3 `day` definition (Asia/Seoul)
+
+Let `event_times[]` be the exploded event timestamps after truncation.
+
+- If **time_valid**: `day = toDate(min(event_times), 'Asia/Seoul')`
+- If **time_invalid**: `day = toDate(trace_created_at, 'Asia/Seoul')` and add tag `TIME_UNRELIABLE`
+
+#### 2.3.1 `time_valid` criteria (deterministic)
+
+`time_valid` is true iff all conditions hold:
+
+- `event_times[]` exists and `n_events > 0`
+- All event timestamps are within `[day_start - 7d, day_end + 7d]` of the run window  
+  (configurable guard; default ±7 days; window is recorded in `run_metadata.time_window_guard`)
+- Timestamps do not match the Unix epoch sentinel pattern (`1970-01-01...`)  
+  (configurable; recorded in `run_metadata.epoch_sentinel_policy`)
+
+#### 2.3.2 Feature handling when `time_invalid` (**Corrected**)
+
+When `TIME_UNRELIABLE` is present:
+
+- `duration_sec = 0`
+- `peak30s = 0`
+- `time_unreliable_count = n_events` (for auditing)
+- These replacements MUST be recorded in `run_metadata.feature_hygiene.time_unreliable_policy`
+- The session is **NOT excluded** from ranking solely due to TIME_UNRELIABLE  
+  (it may still be anomalous due to error/rate-limit/route skew if those are available)
+
+---
+
+## 3. Input Contract
+
+### 3.1 Packed session row (required columns)
+
+Track A consumes a dataset of **session rows** with packed arrays, produced by upstream extraction (e.g., ClickHouse query). Minimum schema:
+
+Identity:
+- `project_id` (string)
+- `trace_id` (string)
+- `trace_created_at` (datetime64(3)) — used for `day` fallback
+- `user_id_norm` (string) — may be precomputed upstream; otherwise computed per §2
+- `session_id_norm` (string) — may be precomputed upstream; otherwise computed per §2
+
+Required arrays (same conceptual length):
+- `event_times[]` (datetime64(3) or int64 epoch ms)
+- `route_groups[]` (string)
+- `outcomes[]` (string) — see §5 contract
+
+Optional arrays:
+- `tokens[]` (uint)
+- `dt_buckets[]` (string) (pre‑bucketed deltas)
+
+### 3.2 Outcome payload contract (**Corrected**)
+
+Track A MUST be able to normalize outcomes deterministically.
+
+Therefore `outcomes[]` MUST be one of:
+
+- **Normalized outcome tokens**: one of `ok`, `error`, `rate_limited`, `timeout`, `canceled` (case-insensitive), OR
+- **Encodable raw signals** with deterministic parsing:
+  - `http:<status>` (e.g., `http:429`, `http:500`)
+  - `level:<LEVEL>` (e.g., `level:ERROR`)
+  - `status_message:<...>` (optional; may aid timeout/canceled classification)
+
+If upstream cannot provide raw HTTP status/level, it MUST provide already-normalized tokens.
+
+The parsing rules and any additional patterns MUST be recorded in `run_metadata.outcome_parsing_policy`.
+
+### 3.3 Minimum viable extraction
+
+If only traces/observations exist, the packed dataset SHOULD be derived by grouping on `(project_id, user_id_norm, session_id_norm)` within a day window, producing aligned arrays ordered by event time.
+
+Track A does not prescribe the exact SQL, but the packed dataset MUST ensure stable ordering for reproducibility (e.g., `ORDER BY event_time ASC, observation_id ASC`).
+
+---
+
+## 4. Packed Raw Explode Specification
+
+### 4.1 Length mismatch policy (deterministic)
+
+Let arrays be: `event_times`, `route_groups`, `outcomes`, `tokens?`, `dt_buckets?`.
+
+- `min_len = min(length(array_i) for required arrays)`
+- Truncate **all** arrays to `min_len`
+- Padding is **prohibited**
+- If `min_len == 0`: tag `EMPTY_SESSION` and exclude from ranking (§8.4)
+
+### 4.2 `explode_meta` (mandatory)
+
+`explode_meta` MUST include:
+
+- `original_lengths`: map of `{array_name: length}`
+- `min_len`
+- `truncated_counts`: map `{array_name: original_len - min_len}` for each array
+- `ordering_key`: description of the ordering used (e.g., `"event_time ASC, observation_id ASC"`)
+
+---
+
+## 5. Outcome Normalization
+
+Outcome space (normalized): `ok`, `error`, `rate_limited`, `timeout`, `canceled`.
+
+### 5.1 Priority mapping (deterministic)
+
+Given each packed outcome element, normalize as follows:
+
+1. If already in normalized space → keep (after lowercasing)
+2. Else if token matches `http:<code>`:
+   - `<code> == 429` → `rate_limited`
+   - `<code> in [400..599] and != 429` → `error`
+3. Else if token matches `level:ERROR` (case-insensitive) → `error`
+4. Else → `ok`
+
+If multiple signals are encoded in a single token (e.g., `http:429|level:ERROR`), apply priority above across all parsed parts.
+
+### 5.2 Derived counters
+
+- `error_count = count(outcome == "error")`
+- `rate_limited_count = count(outcome == "rate_limited")`
+
+---
+
+## 6. Route Group Normalization
+
+### 6.1 Responsibility boundary (**Clarified**)
+
+- **Upstream packing** is responsible for producing `route_groups[]` using the priority below.
+- Track A MAY apply masking (§6.3) and MAY fallback to `"UNKNOWN_ROUTE"` when elements are missing.
+
+### 6.2 Priority (for upstream packing)
+
+1. `traces.metadata["user_api_key_request_route"]`
+2. `observation.name`
+3. `"UNKNOWN_ROUTE"`
+
+### 6.3 Optional masking (recommended)
+
+Mask dynamic segments (numeric IDs, UUIDs, long hashes). The default masking policy SHOULD replace:
+
+- UUIDs → `:uuid`
+- 8+ hex strings → `:hex`
+- numbers → `:num`
+
+Masking MUST be deterministic and recorded in `run_metadata.masking_policy`.
+
+---
+
+## 7. Feature Definitions (Deterministic)
+
+If `n_events == 0`:
+- Exclude from ranking
+- Tag: `EMPTY_SESSION`
+
+Let `n_events = len(event_times)` (after truncation).
+
+### 7.1 `duration_sec`
+
+If `TIME_UNRELIABLE`: `duration_sec = 0` (per §2.3.2)  
+Else: `duration_sec = max(0, (max(event_times) - min(event_times)).total_seconds())`
+
+### 7.2 `error_rate`, `rate_limited_rate`
+
+`error_rate = error_count / n_events`  
+`rate_limited_rate = rate_limited_count / n_events`
+
+### 7.3 `peak30s` (burstiness)
+
+If `TIME_UNRELIABLE`: `peak30s = 0` (per §2.3.2)  
+Else: `peak30s = max number of events within any rolling 30‑second window`.
+
+Reference algorithm (deterministic):
+- Sort `event_times` ascending (should already be sorted)
+- Two‑pointer sliding window to compute maximum count where `t[j] - t[i] <= 30s`
+
+### 7.4 `route_skew` (**Corrected**)
+
+Route skew is defined as the maximum single‑route share.
+
+- Compute counts per normalized route group: `c_r`
+- `route_skew = max(c_r) / n_events` (if `n_events>0`, else 0)
+
+### 7.5 Feature vector
+
+`X = [n_events, duration_sec, error_rate, rate_limited_rate, peak30s, route_skew]`
+
+### 7.6 Feature hygiene
+
+- Any NaN/Inf MUST be replaced deterministically:
+  - NaN → 0
+  - +Inf → max finite value observed in column (within run) or a fixed cap (configurable; recorded)
+- Record replacements in `run_metadata.feature_hygiene`.
+
+---
+
+## 8. IsolationForest Ranking
+
+### 8.1 Model (Frozen)
+
+IsolationForest on feature matrix `X`.
+
+Frozen parameters:
+
+- `n_estimators = 200`
+- `max_samples = "auto"`
+- `contamination = "auto"`
+- `random_state = 42`
+
+### 8.2 Score definition (Frozen)
+
+`if_raw = -model.score_samples(X)`
+
+Rank sessions by `if_raw` **descending** (higher = more anomalous).
+
+### 8.3 Fit scope (Frozen default)
+
+Track A fits one model per `(project_id, day)` partition by default (recommended), unless configured to fit per `project_id` across the run window.
+
+The chosen scope MUST be recorded in `run_metadata.model_scope`.
+
+### 8.4 Exclusions (Frozen)
+
+Sessions tagged `EMPTY_SESSION` MUST be excluded from fitting and ranking outputs, but MUST be written to `excluded_sessions` for auditing.
+
+---
+
+## 9. risk_score_v2 (Policy Score)
+
+`risk_score_v2` is a deterministic, policy‑interpretable score in **0..100**.
+
+### 9.1 Helpers
+
+`clip01(x) = min(1, max(0, x))`
+
+### 9.2 Components
+
+- `S_error = clip01((error_rate - 0.05) / 0.35)`
+- `S_rl    = clip01((rate_limited_rate - 0.02) / 0.30)`
+- `S_burst = clip01((peak30s - 8) / 20)`
+- `S_route = clip01((route_skew - 0.70) / 0.30)`
+- `S_long  = clip01((ln(1+duration_sec) - ln(1+1800)) / (ln(1+21600) - ln(1+1800)))`
+
+### 9.3 Weighted sum
+
+`risk_score_v2_raw = 100 * ( 0.35*S_error + 0.25*S_rl + 0.25*S_burst + 0.10*S_route + 0.05*S_long )`
+
+### 9.4 FP downweight rule (Frozen)
+
+If `error_rate == 0` AND `rate_limited_rate < 0.02` AND `duration_sec >= 3600`:
+
+- `risk_score_v2 = risk_score_v2_raw * 0.6`
+- Add tag `NORMAL_LONG_SESSION_HINT`
+
+Else:
+
+- `risk_score_v2 = risk_score_v2_raw`
+
+`risk_score_v2` MUST be rounded to 2 decimal places for display, but raw float should be stored for computation.
+
+---
+
+## 10. risk_tags
+
+### 10.1 Atomic tags (Frozen)
+
+- `ERROR_HEAVY` (error_rate ≥ 0.20)
+- `RATE_LIMIT_HEAVY` (rate_limited_rate ≥ 0.15)
+- `BURST` (peak30s ≥ 20)
+- `EXTREME_BURST` (peak30s ≥ 40)
+- `ROUTE_SKEW` (route_skew ≥ 0.90)
+- `LONG_DURATION` (duration_sec ≥ 7200)
+- `TIME_UNRELIABLE`
+- `EMPTY_SESSION`
+- `NORMAL_LONG_SESSION_HINT`
+
+### 10.2 Composite tags (Frozen; deterministic)
+
+- `RETRY_STORM` if (`RATE_LIMIT_HEAVY` OR `ERROR_HEAVY`) AND (`BURST` OR `EXTREME_BURST`)
+- `POLICY_PRESSURE` if `RATE_LIMIT_HEAVY` AND (`route_skew ≥ 0.80` OR `peak30s ≥ 20`)
+- `SINGLE_ROUTE_LOOP` if `route_skew ≥ 0.95` AND `n_events ≥ 20`
+
+All composite rules MUST be recorded in `run_metadata.risk_tag_rules_hash`.
+
+---
+
+## 11. Explanation Artifacts (Top‑K)
+
+Track A MUST emit **two layers** of explanation for human review:
+
+1. **Summary**: table for Top‑K sessions (quick triage)
+2. **Drilldown**: per‑session details (why + timeline)
+
+### 11.1 Summary artifact (mandatory fields)
+
+Per ranked session row:
+
+Identity:
+- `day`, `project_id`, `user_id_norm`, `session_id_norm`, `rank`
+
+Scores:
+- `if_raw`
+- `risk_score_v2`
+- `risk_score_if`: `100 * clip01((if_raw - p50) / (p95 - p50))` computed per partition  
+  where `p50,p95` are percentiles of `if_raw` in the same model scope. If `p95==p50`, set `risk_score_if=0`.
+
+Core features:
+- `n_events`, `duration_sec`, `error_rate`, `rate_limited_rate`, `peak30s`, `route_skew`
+
+Signals:
+- `risk_tags` (sorted list)
+- `primary_reason_code` (one of: `ERROR`, `RATE_LIMIT`, `BURST`, `ROUTE_SKEW`, `LONG`, `TIME_UNRELIABLE`, `MIXED`)
+- `why_ranked` (one‑line human text; deterministic template)
+- `timeline_1line` (compact fixed format; see §11.4)
+- `explode_meta` (or reference id)
+
+### 11.2 Drilldown artifact (mandatory fields)
+
+One record per session (Top‑K and optionally Top‑N):
+
+Identity:
+- `day`, `project_id`, `user_id_norm`, `session_id_norm`, `rank`
+
+Scores & features:
+- `if_raw`, `risk_score_if`, `risk_score_v2`
+- features and counters
+- `risk_tags`
+
+Explain:
+- `component_breakdown`: `{S_error, S_rl, S_burst, S_route, S_long, weights, risk_score_v2_raw}`
+- `threshold_hits`: list of triggered atomic/composite rules with observed values
+- `top_feature_deviation`: per feature deviation vs median (deterministic robust scaling; median/MAD within partition)
+- `route_histogram`: top routes with counts and shares
+- `outcome_histogram`: counts per outcome
+- `timeline`: array of `{t, route_group, outcome, token?}` (truncated to `min_len`)
+- `explode_meta`
+
+### 11.3 Deterministic `primary_reason_code` selection (**Corrected**)
+
+Compute in this exact priority order:
+
+1. If `TIME_UNRELIABLE` in `risk_tags` → `TIME_UNRELIABLE`
+2. Else if `RETRY_STORM` in `risk_tags`:
+   - If `rate_limited_rate >= error_rate` → `RATE_LIMIT`
+   - Else → `ERROR`
+3. Else if `EXTREME_BURST` in `risk_tags` → `BURST`
+4. Else if `ERROR_HEAVY` in `risk_tags` → `ERROR`
+5. Else if `RATE_LIMIT_HEAVY` in `risk_tags` → `RATE_LIMIT`
+6. Else if `ROUTE_SKEW` in `risk_tags` → `ROUTE_SKEW`
+7. Else if `LONG_DURATION` in `risk_tags` → `LONG`
+8. Else → `MIXED`
+
+### 11.4 Deterministic `timeline_1line` format (**Corrected**)
+
+`timeline_1line` MUST follow exactly:
+
+`"{t0}..{tN} (dur={duration_sec}s); n={n_events}; peak30s={peak30s}; routes={top3_routes}; outcomes=ok:{ok} err:{err} rl:{rl}; first_err={first_err_or_dash}; first_rl={first_rl_or_dash}"`
+
+Where:
+- `t0,tN` are ISO timestamps in Asia/Seoul if `time_valid`, else `"TIME_UNRELIABLE"`
+- `top3_routes` is `route:count(share)` joined by `, `
+- `first_err_or_dash` is first timestamp where outcome==error, else `-` (respect TIME_UNRELIABLE)
+- `first_rl_or_dash` similarly for rate_limited
+
+### 11.5 Deterministic ranking tie‑breakers (**Corrected**)
+
+Ranking order within a partition MUST be:
+
+`ORDER BY if_raw DESC, risk_score_v2 DESC, n_events DESC, session_id_norm ASC`
+
+This ensures stable ranks under equal/near-equal anomaly scores.
+
+### 11.6 Top‑K selection (Frozen default)
+
+Default: `K = 200` per `(project_id, day)` partition (configurable). `K` and selection scope MUST be in `run_metadata`.
+
+---
+
+## 12. Pseudo‑Label Rules (Frozen)
+
+Label space: `suspicious`, `needs_review`, `benign_fp`, `normal`.
+
+Priority:
+
+1. `RETRY_STORM` AND `risk_score_v2 ≥ 80` → `suspicious`
+2. `EXTREME_BURST` AND (`ERROR_HEAVY` OR `RATE_LIMIT_HEAVY`) → `suspicious`
+3. `risk_score_v2 ≥ 80` → `suspicious`
+4. `NORMAL_LONG_SESSION_HINT` → `benign_fp`
+5. `risk_score_v2 ∈ [50, 80)` → `needs_review`
+6. else → `normal`
+
+Each suggestion MUST include:
+- `label_suggested`
+- `action_suggested` (non‑binding): one of `review`, `monitor`, `rate_limit_candidate`, `block_candidate`
+- `reason_code` (aligned with `primary_reason_code`)
+- `confidence` (0..1; deterministic; see below)
+
+### 12.1 Deterministic confidence mapping (**Corrected**)
+
+Let `s = risk_score_v2` (raw float before rounding).
+
+- If `label_suggested == "suspicious"`:
+  - `confidence = min(1.0, 0.60 + 0.40 * clip01((s - 80) / 20))`
+- Else if `label_suggested == "needs_review"`:
+  - `confidence = 0.30 + 0.30 * clip01((s - 50) / 30)`
+- Else if `label_suggested == "benign_fp"`:
+  - `confidence = 0.70`
+- Else (`normal`):
+  - `confidence = 0.20`
+
+Round `confidence` to 3 decimals for display; store raw float for computation.
+
+---
+
+## 13. Review Log Schema (for human loop)
+
+Identity:
+- `review_id`
+- `day`, `project_id`, `user_id_norm`, `session_id_norm`
+- `rank`
+
+Snapshot (frozen at review time):
+- `if_raw`
+- `risk_score_if`
+- `risk_score_v2`
+- `risk_tags`
+- `why_ranked`
+- `timeline_1line`
+- `explode_meta`
+- `run_metadata_ref`
+
+Human decision:
+- `label` (same label space)
+- `action_suggested` (human)
+- `reason_code`
+- `confidence`
+- `notes`
+- `reviewer`
+- `reviewed_at`
+- `label_source` (e.g., `human`, `imported`, `auto_accept`)
+
+---
+
+## 14. run_metadata (Mandatory)
+
+Track A MUST emit `run_metadata.json` containing:
+
+- `spec_version` (="1.0.1")
+- `revision` (="revised-2026-02-20-frozen-2026-02-20")
+- `feature_version` (semantic version for feature logic)
+- `if_params` (all model params)
+- `model_scope`
+- `data_fingerprint` (hash of input rows + schema)
+- `code_sha` (git SHA or build hash)
+- `generated_at`
+- `masking_policy`
+- `outcome_parsing_policy`
+- `time_window_guard`
+- `epoch_sentinel_policy`
+- `feature_hygiene`
+- `risk_tag_rules_hash`
+- `topk_k`
+- `partition_keys`
+- `ranking_tiebreakers` (exact string from §11.5)
+
+---
+
+## 15. Output Artifacts (Reproducible)
+
+Minimum set (per run):
+
+- `topk_summary.parquet` (or `.csv`) — Summary (§11.1)
+- `topk_drilldown.jsonl` — Drilldown (§11.2)
+- `review_log.parquet` — empty template or appended log (§13)
+- `excluded_sessions.parquet` — sessions excluded from ranking (§8.4)
+- `run_metadata.json` — mandatory (§14)
+
+All artifacts MUST be joinable by `(project_id, day, user_id_norm, session_id_norm)`.
+
+### 15.1 excluded_sessions schema (**Corrected**)
+
+`excluded_sessions` MUST include:
+
+- identity: `day`, `project_id`, `user_id_norm`, `session_id_norm`, `trace_id`
+- `exclude_reason` (currently only `EMPTY_SESSION` under this spec)
+- `risk_tags`
+- `explode_meta`
+- `trace_created_at`
+
+---
+
+## 16. Determinism & Reproducibility (Frozen)
+
+- Sorting order for events MUST be stable and recorded.
+- Truncation uses `min_len` only (no padding).
+- Randomness limited to `random_state=42` in IsolationForest.
+- Feature code MUST be versioned via `feature_version` and `code_sha`.
+- Input data fingerprint MUST change when source data changes.
+- Ranking MUST use deterministic tie‑breakers (§11.5).
+
+---
+
+## 17. Compatibility Notes
+
+Track A outputs are designed to feed Track B and the Policy Engine as **signals**, not decisions.
+
+Track B may:
+- aggregate over time windows,
+- combine identity trust signals,
+- apply policy thresholds and actions.
+
+---
+
+**End of document.**
+
+
+# BehaviorGuard Research Evaluation Protocol v1.0 (Frozen)
+
+Status: **Frozen for Research Phase**
+Applies To: Track A / Track B / Track C
+Timezone: Asia/Seoul
+Generated At: 2026-02-20T20:37:23.580007+09:00
+
+> This document defines the unified evaluation framework for all experiment tracks.
+> Any change requires version bump.
+
+---
+
+# 1. Scope
+
+This protocol standardizes:
+
+- Precision@K (relaxed)
+- Top-K overlap comparison
+- Stability across time windows
+- Self-consistency (single reviewer model)
+
+All tracks MUST comply with this protocol.
+
+---
+
+# 2. Dataset Rules
+
+- Same dataset (identical data_fingerprint) must be used for cross-track comparison.
+- Same partition scope (project_id, day).
+- Same K value across tracks (default K = 200).
+- Random seeds must be fixed per model.
+
+---
+
+# 3. Precision@K (Relaxed Definition — Frozen)
+
+## 3.1 Label Space
+
+Allowed labels:
+
+- suspicious
+- needs_review
+- benign_fp
+- normal
+
+## 3.2 Positive Definition (Frozen)
+
+Positive := label in {suspicious, needs_review}
+
+## 3.3 Metric Definition
+
+Precision@K_relaxed = (# Positive in Top-K) / K
+
+Where:
+- K = 200 (default unless explicitly overridden and recorded in run_metadata)
+- Evaluation is session-level.
+
+---
+
+# 4. Self-Consistency Metric (Single Reviewer Model)
+
+Since reviewer_count = 1, disagreement metric is replaced with temporal self-consistency.
+
+Procedure:
+
+1. Perform initial labeling of Top-K.
+2. After time gap (recommended ≥ 7 days), re-label same Top-K without referencing prior labels.
+3. Compute:
+
+Consistency@K = (# identical labels between two reviews) / K
+
+This metric measures reviewer stability over time.
+
+---
+
+# 5. Top-K Overlap Ratio
+
+Used for cross-track comparison.
+
+## 5.1 Overlap Ratio (Directional)
+
+Overlap(A→B) = |TopK_A ∩ TopK_B| / K
+
+Where K is the same across both tracks.
+
+## 5.2 Jaccard Index (Symmetric)
+
+Jaccard(A,B) = |TopK_A ∩ TopK_B| / |TopK_A ∪ TopK_B|
+
+Both MUST be recorded when comparing tracks.
+
+---
+
+# 6. Stability Across Time Windows
+
+Measures model stability across adjacent time partitions.
+
+Given:
+- Same model configuration
+- Day D and Day D+1
+
+Compute:
+
+1. Risk Score Distribution Drift
+   - Compare distribution statistics (mean, median, std)
+   - Record percentile shifts (p50, p95)
+
+2. Top-K Stability
+
+TopK_Stability = |TopK_D ∩ TopK_D+1| / K
+
+Both metrics MUST be recorded.
+
+---
+
+# 7. Reporting Requirements
+
+Each experiment report MUST include:
+
+- Precision@K_relaxed
+- Consistency@K (if available)
+- Top-K Overlap (Directional + Jaccard)
+- Stability across time windows
+- Computational cost summary
+- Observed qualitative pattern differences
+
+---
+
+# 8. Version Control
+
+Version: 1.0
+Phase: Research Mode
+Last Updated: 2026-02-20T20:37:23.580007+09:00
+
+---
+
+**End of document.**
