@@ -1,0 +1,41 @@
+실행 방법 (바로 복붙)
+1) Track A 세션 parquet → Track C v0/v1/v2 생성
+python make_trackc_inputs_from_tracka_sessions.py \
+  --in "out/common/sessions_packed_*.parquet" \
+  --out "out/track_c" \
+  --max-seq-len 2048 \
+  --versions "v0,v1,v2"
+2) vocab 생성
+python build_vocab.py \
+  --trackc-root "out/track_c" \
+  --min-freq 3 \
+  --max-vocab 50000 \
+  --versions "v0,v1,v2"
+3) (옵션) ids 생성
+python make_ids.py --trackc-root out/track_c --client "Cline SR" --version v1
+python make_ids.py --trackc-root out/track_c --client "Cline SR" --version v2
+
+
+# (옵션) ids 생성 먼저 (client별/버전별)
+python make_ids.py --trackc-root out/track_c --client "Cline SR" --version v1
+
+# C1: LSTM LM
+python train_c1_lstm_lm.py --trackc-root out/track_c --client "Cline SR" --version v1 --epochs 3
+
+# C2: Small Transformer LM
+python train_c2_small_tx_lm.py --trackc-root out/track_c --client "Cline SR" --version v1 --epochs 3
+
+# C3: Sequence Autoencoder
+python train_c3_seq_ae.py --trackc-root out/track_c --client "Cline SR" --version v1 --epochs 3
+
+
+
+사용법
+1) 실행 권한
+chmod +x run_trackc_e2e.sh
+2) 기본 실행 (v1만 빠르게)
+./run_trackc_e2e.sh
+3) 특정 client만 (빠른 루프)
+ONLY_CLIENT="Cline SR" ./run_trackc_e2e.sh
+4) v0,v1,v2 다 돌리기 (시간/자원 여유 있을 때)
+VERSIONS_CSV="v0,v1,v2" ./run_trackc_e2e.sh
