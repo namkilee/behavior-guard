@@ -47,6 +47,13 @@ latest_run_dir() {
   ls -1dt "$base"/* 2>/dev/null | head -n 1 || true
 }
 
+latest_run_dir_by_prefix() {
+  # $1 = runs base dir, $2 = prefix like "v1_"
+  local base="$1"
+  local prefix="$2"
+  ls -1dt "$base"/"${prefix}"* 2>/dev/null | head -n 1 || true
+}
+
 # =========================
 # Preconditions
 # =========================
@@ -54,10 +61,14 @@ need_cmd python
 need_cmd ls
 need_cmd awk
 need_cmd sed
+need_cmd find
+need_cmd sort
+need_cmd basename
 
 echo "[INFO] TRACKA_IN_GLOB=$TRACKA_IN_GLOB"
 echo "[INFO] TRACKC_ROOT=$TRACKC_ROOT"
 echo "[INFO] VERSIONS=$VERSIONS_CSV"
+echo "[INFO] ONLY_CLIENT=${ONLY_CLIENT:-<ALL>}"
 
 # =========================
 # 1) Build Track C inputs (v0/v1/v2)
@@ -161,21 +172,26 @@ for c in "${CLIENTS[@]}"; do
 done
 
 # =========================
-# 5) Score (test/val/train) using latest checkpoints
+# 5) Score (test/val/train) using latest checkpoints (VERSION-AWARE)
 # =========================
-echo "[STEP] 5/6 Score models on split='$SPLIT_SCORE'"
+echo "[STEP] 5/6 Score models on split='$SPLIT_SCORE' (version-aware ckpt selection)"
 for c in "${CLIENTS[@]}"; do
   for v in "${VERSIONS[@]}"; do
     echo "  [SCORE] client='$c' version='$v' split='$SPLIT_SCORE'"
 
-    # Find latest run dirs
+    # Runs base dirs (NOTE: must match train scripts)
     c1_base="$TRACKC_ROOT/$c/runs/c1_lstm_lm"
     c2_base="$TRACKC_ROOT/$c/runs/c2_small_tx_lm"
     c3_base="$TRACKC_ROOT/$c/runs/c3_seq_ae"
 
-    c1_run="$(latest_run_dir "$c1_base")"
-    c2_run="$(latest_run_dir "$c2_base")"
-    c3_run="$(latest_run_dir "$c3_base")"
+    # Version-aware: select latest run whose dirname starts with "${v}_"
+    c1_run="$(latest_run_dir_by_prefix "$c1_base" "${v}_")"
+    c2_run="$(latest_run_dir_by_prefix "$c2_base" "${v}_")"
+    c3_run="$(latest_run_dir_by_prefix "$c3_base" "${v}_")"
+
+    [[ -n "$c1_run" ]] || { echo "[FATAL] No run dir for client='$c' version='$v' under $c1_base" >&2; exit 1; }
+    [[ -n "$c2_run" ]] || { echo "[FATAL] No run dir for client='$c' version='$v' under $c2_base" >&2; exit 1; }
+    [[ -n "$c3_run" ]] || { echo "[FATAL] No run dir for client='$c' version='$v' under $c3_base" >&2; exit 1; }
 
     c1_ckpt="$c1_run/best.pt"
     c2_ckpt="$c2_run/best.pt"
@@ -184,6 +200,10 @@ for c in "${CLIENTS[@]}"; do
     [[ -f "$c1_ckpt" ]] || { echo "[FATAL] missing ckpt: $c1_ckpt" >&2; exit 1; }
     [[ -f "$c2_ckpt" ]] || { echo "[FATAL] missing ckpt: $c2_ckpt" >&2; exit 1; }
     [[ -f "$c3_ckpt" ]] || { echo "[FATAL] missing ckpt: $c3_ckpt" >&2; exit 1; }
+
+    echo "    [CKPT] c1=$c1_ckpt"
+    echo "    [CKPT] c2=$c2_ckpt"
+    echo "    [CKPT] c3=$c3_ckpt"
 
     # C1
     python score_trackc_models.py \
