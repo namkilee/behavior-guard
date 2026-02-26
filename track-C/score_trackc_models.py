@@ -116,7 +116,13 @@ def per_token_ce(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     # returns [B, T] cross-entropy per position (no reduction)
     loss_fct = nn.CrossEntropyLoss(reduction="none")
     B, T, V = logits.shape
-    loss = loss_fct(logits.view(B*T, V), labels.view(B*T)).view(B, T)
+
+    # reshape() is safe for non-contiguous tensors (will copy if needed)
+    loss = loss_fct(
+        logits.reshape(B * T, V),
+        labels.reshape(B * T),
+    ).reshape(B, T)
+
     return loss
 
 
@@ -142,7 +148,9 @@ def score_lm_batch(
     tail_nll = ce_tail.sum(dim=1) / denom_tail
 
     # max token nll (useful for spikes)
-    max_nll = (ce + (1.0 - shift_mask.float()) * (-1e9)).max(dim=1).values  # ignore pad by -inf
+    ce_masked = ce.masked_fill(shift_mask == 0, float("-inf"))
+    max_nll = ce_masked.max(dim=1).values
+    max_nll = torch.where(torch.isfinite(max_nll), max_nll, torch.zeros_like(max_nll))  # all-pad safety
     return {"score_mean_nll": mean_nll, "score_tail_nll": tail_nll, "score_max_nll": max_nll}
 
 
@@ -200,6 +208,8 @@ def main() -> None:
         scorer = "ae"
 
     state = torch.load(args.ckpt, map_location="cpu")
+    if isinstance(state, dict) and "state_dict" in state:
+        state = state["state_dict"]
     model.load_state_dict(state)
     model.eval()
 
