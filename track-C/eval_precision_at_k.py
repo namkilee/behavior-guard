@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import glob
 import os
-from typing import List, Tuple, Dict
+from typing import List
 
 import polars as pl
 
@@ -18,13 +18,16 @@ def load_tracka_sessions(in_glob: str) -> pl.DataFrame:
     paths = sorted(glob.glob(in_glob)) if any(ch in in_glob for ch in "*?[]") else [in_glob]
     if not paths:
         raise SystemExit(f"No input files matched: {in_glob}")
+
     dfs = [pl.read_parquet(p) for p in paths]
     df = pl.concat(dfs, how="diagonal_relaxed")
-    # need join keys + outcomes
-    need = ["client_name", "day", "user_id", "session_key", "outcomes"]
+
+    # required columns for join / weak label
+    need = ["client_name", "user_id", "session_key", "outcomes"]
     missing = [c for c in need if c not in df.columns]
     if missing:
         raise ValueError(f"TrackA session parquet missing columns: {missing}. Found: {df.columns}")
+
     return df.select(need)
 
 
@@ -57,7 +60,7 @@ def main() -> None:
     ap.add_argument("--score-cols", default="", help="Comma separated score columns to evaluate. Default: all score_* cols")
     args = ap.parse_args()
 
-    pos_set = set([s.strip().lower() for s in args.pos_outcomes.split(",") if s.strip()])
+    pos_set = {s.strip().lower() for s in args.pos_outcomes.split(",") if s.strip()}
     ks = [int(x.strip()) for x in args.ks.split(",") if x.strip()]
 
     df_a = load_tracka_sessions(args.tracka_in)
@@ -68,7 +71,16 @@ def main() -> None:
         df_s = df_s.filter(pl.col("client_name") == args.client)
 
     # Join labels onto scored sessions
-    df = df_s.join(df_a, on=["client_name", "day", "user_id", "session_key"], how="left")
+    join_keys = ["client_name", "user_id", "session_key"]
+    missing_a = [c for c in join_keys if c not in df_a.columns]
+    missing_s = [c for c in join_keys if c not in df_s.columns]
+    if missing_a or missing_s:
+        raise ValueError(
+            f"Join key mismatch. missing in tracka={missing_a}, missing in scores={missing_s}. "
+            f"tracka_cols={df_a.columns}, scores_cols={df_s.columns}"
+        )
+
+    df = df_s.join(df_a, on=join_keys, how="left")
 
     # Build weak label
     df = df.with_columns(
@@ -105,7 +117,6 @@ def main() -> None:
     out = pl.DataFrame(rows).sort(["score_col", "K"])
     print(out)
 
-    # Optional: write sidecar
     out_path = os.path.splitext(args.scores)[0] + "_precision_at_k.parquet"
     out.write_parquet(out_path, compression="zstd")
     print(f"[OK] wrote: {out_path}")
